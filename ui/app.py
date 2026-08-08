@@ -4623,6 +4623,84 @@ class RelicBotApp(tk.Tk):
         self._log("  WARNING: Steam did not shut down within 30s.")
         return False
 
+    # How long to wait for the Steam client to register itself after we start
+    # it, and how long to let it settle once it has.  The settle window is
+    # what lets Steam finish its own connect-or-fall-back-to-offline
+    # transition before a game is allowed to attach to it.  Both are here so
+    # they can be tuned from one place after watching a real restart.
+    _STEAM_READY_TIMEOUT = 90.0
+    _STEAM_SETTLE_SECS = 20.0
+
+    @staticmethod
+    def _steam_registered_pid() -> int:
+        """The PID Steam publishes for itself once the client has initialised.
+
+        LOAD-BEARING: this is deliberately NOT "does steam.exe exist".  A
+        process that has been spawned but has not finished coming up is
+        exactly the state that hands a launching game a Steam with no usable
+        session — which is what stranded a run on the game's "Network status
+        check failed" dialog on 2026-08-08.  Steam writes its own PID to this
+        key when the client is up and 0 when it is not, so a non-zero value
+        that matches a live process is a readiness signal rather than a
+        presence check.  Returns 0 when it cannot be determined.
+        """
+        try:
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Valve\Steam\ActiveProcess") as _key:
+                _pid, _ = winreg.QueryValueEx(_key, "pid")
+                return int(_pid or 0)
+        except Exception:
+            return 0
+
+    def _steam_client_ready(self) -> bool:
+        """True when Steam has registered a PID that is genuinely running."""
+        _pid = self._steam_registered_pid()
+        if not _pid:
+            return False
+        return _pid in _pids_for_exe("steam.exe")
+
+    def _start_steam_client(self) -> bool:
+        """Start the Steam client on its own, with no game attached.
+
+        The steam:// protocol URL starts Steam *and* queues the game in one
+        call, so the game races Steam's own start-up.  Starting the client
+        first is what makes the readiness wait below mean anything.
+        """
+        _steam_exe = getattr(self, "_steam_exe_path", "") or ""
+        if not _steam_exe or not os.path.isfile(_steam_exe):
+            self._log("  WARNING: steam.exe path not configured — "
+                      "cannot start Steam on its own.")
+            return False
+        try:
+            subprocess.Popen([_steam_exe], close_fds=True)
+            return True
+        except Exception as _se:
+            self._log(f"  WARNING: Could not start Steam: {_se}")
+            return False
+
+    def _wait_for_steam_ready(self) -> bool:
+        """Wait for Steam to initialise, then let it settle.
+
+        Returns False if Steam never registers itself inside the timeout, so
+        the caller can decline to launch the game rather than attaching it to
+        a half-started client.
+        """
+        _end = time.time() + self._STEAM_READY_TIMEOUT
+        while self.bot_running and time.time() < _end:
+            if self._steam_client_ready():
+                self._log(
+                    f"  Steam client ready (pid "
+                    f"{self._steam_registered_pid()}) — settling for "
+                    f"{self._STEAM_SETTLE_SECS:.0f}s before launching…")
+                _settle_end = time.time() + self._STEAM_SETTLE_SECS
+                while self.bot_running and time.time() < _settle_end:
+                    time.sleep(0.5)
+                return True
+            time.sleep(1.0)
+        return False
+
     _STEAM_APP_ID = "2622380"
 
     # ------------------------------------------------------------------ #
@@ -6802,23 +6880,59 @@ class RelicBotApp(tk.Tk):
                         if self._shutdown_steam():
                             _steam_reset_done = True
                             _launch_attempts += 1
+                            # Start Steam on its own FIRST, and wait until it
+                            # has actually come up before letting the game
+                            # attach to it.
+                            #
+                            # LOAD-BEARING: the previous version waited for a
+                            # steam.exe that NOTHING had started — the wait
+                            # could only ever time out — and then fired
+                            # steam://rungameid, which starts Steam and the
+                            # game in one call.  The game therefore reached
+                            # its network check while Steam was still coming
+                            # up, and got "Network status check failed" with
+                            # no way to recover.  Measured 2026-08-08: the
+                            # 30 s wait expired to the second, and Steam
+                            # logged no activity at all for the next 8
+                            # minutes.  Do not collapse these back into a
+                            # single protocol launch.
+                            self._log("  Starting Steam on its own…")
+                            if not self._start_steam_client():
+                                self._log(
+                                    "ERROR: could not start Steam after the "
+                                    "reset — cancelling batch.")
+                                if _async_mode and _async_relic_q is not None:
+                                    _shutdown_async_workers()
+                                    _async_join_timed()
+                                self.after(0, self._reset_controls)
+                                return
+                            self._log("  Waiting for the Steam client to "
+                                      "finish starting…")
+                            if not self._wait_for_steam_ready():
+                                self._log(
+                                    f"ERROR: Steam did not finish starting "
+                                    f"within "
+                                    f"{self._STEAM_READY_TIMEOUT:.0f}s — "
+                                    f"refusing to launch the game into a "
+                                    f"half-started client. Cancelling batch.")
+                                if self._diag:
+                                    try:
+                                        self._diag.log_game(
+                                            event="launch_fail",
+                                            attempt=_launch_attempts,
+                                            note="Steam client never became "
+                                                 "ready after reset")
+                                    except Exception:
+                                        pass
+                                if _async_mode and _async_relic_q is not None:
+                                    _shutdown_async_workers()
+                                    _async_join_timed()
+                                self.after(0, self._reset_controls)
+                                return
                             self._log(
                                 f"Launching game "
                                 f"(attempt {_launch_attempts} — after "
                                 f"Steam reset)…")
-                            # Wait for Steam to be ready before launching.
-                            # The protocol URL opens Steam if not running,
-                            # but Steam needs a moment to initialize.
-                            self._log(
-                                "  Waiting for Steam to restart…")
-                            _steam_ready_end = time.time() + 30
-                            while self.bot_running and time.time() < _steam_ready_end:
-                                if _pids_for_exe("steam.exe"):
-                                    time.sleep(3.0)  # let Steam finish init
-                                    break
-                                time.sleep(1.0)
-                            # Use the normal Steam protocol URL — Steam is
-                            # freshly restarted with a clean session state.
                             self._launch_game()
                             self._set_status(
                                 f"Batch {iteration}: Steam restarting — "
@@ -10782,6 +10896,11 @@ class RelicBotApp(tk.Tk):
                     # analyze() with preview crop doubles as slot-0 capture.
                     # Require at least one PASSIVE token or relics_found with passives
                     # to avoid accepting a Scenic Flatstone shop-tooltip as confirmation.
+                    # Initialised here, not first-assigned in the poll loop: the
+                    # buy-count reconciliation below reads it, and a cycle whose
+                    # settle loop never ran would otherwise raise NameError —
+                    # the same unbindable-name class as v1.8.10.
+                    _settle_img              = None
                     _settle_ok               = False
                     _settle_no_passives      = False   # relic name seen but zero passives
                     _settle_insufficient_murk = False  # buy failed — no murk left
@@ -11177,6 +11296,87 @@ class RelicBotApp(tk.Tk):
                 # needed in automation), wait a short settle, then capture+analyze.
                 # Skipped entirely if _p1_scan is False (no-passive preview batch).
                 if self.phase_events[2] and _p1_scan:
+                    # ── Buy-count reconciliation via murk delta ───────────── #
+                    # X/N is the fast answer, but it is a two-glyph OCR read and
+                    # is documented to misread the quantity.  The murk counter
+                    # is the game's own arithmetic on a six-digit number, and
+                    # the difference ACROSS the purchase is a measurement of
+                    # what was actually bought rather than a prediction.
+                    #
+                    # Both captures already exist, so this costs two small-region
+                    # OCR calls and no extra screenshots:
+                    #   _qty_jpeg    buy dialog, taken BEFORE the confirm F
+                    #   _settle_img  the frame that confirmed the relic preview
+                    #
+                    # LOAD-BEARING: this runs BEFORE the scan loop.  Learning
+                    # after the fact that a relic was missed is worth nothing —
+                    # the cycle has already Q-backed to the shop and the preview
+                    # list is gone.  Establishing the true count HERE is what
+                    # lets Phase 2 keep walking the circular preview until it has
+                    # found every relic that was actually paid for.
+                    #
+                    # Verified on batch_run_2026-08-08_010535: three independent
+                    # buy-qty dumps each showed a murk delta that was an exact
+                    # multiple of 10 relics per completed cycle, while the bot's
+                    # own clamped accounting claimed 35 where murk said 40.
+                    # murk_cost comes straight from the relic type (1800 deep /
+                    # 600 normal) and is always right.  _per_relic_murk_cost is
+                    # LEARNED as cycle_cost // batch_size, so it inherits any
+                    # error in the very quantity this check exists to verify —
+                    # it must never be the divisor when the real cost is known.
+                    _per_cost = murk_cost or getattr(
+                        self, "_per_relic_murk_cost", None)
+                    if (_per_cost and _per_cost > 0
+                            and _qty_jpeg is not None
+                            and _settle_img is not None):
+                        _mk_before = _mk_after = 0
+                        try:
+                            _mk_before, _ = relic_analyzer.read_murk(
+                                _qty_jpeg, region=self._murk_region)
+                            _mk_after, _ = relic_analyzer.read_murk(
+                                _settle_img, region=self._murk_region)
+                        except Exception:
+                            pass
+                        _mk_delta = (_mk_before or 0) - (_mk_after or 0)
+                        _mk_bought = None
+                        if _mk_delta > 0 and _mk_delta % _per_cost == 0:
+                            _mk_bought = _mk_delta // _per_cost
+                        # Fail CLOSED.  Only a positive delta that divides
+                        # exactly by the per-relic cost AND lands at or below
+                        # what X/N claimed is allowed to move _batch_size, so a
+                        # misread murk value can never inflate the scan target.
+                        # A murk count ABOVE X/N is logged but NOT acted on:
+                        # every observed failure so far is X over-reading, and
+                        # there is no evidence yet for the other direction.
+                        if _mk_bought is not None and 0 < _mk_bought <= _batch_size:
+                            if _mk_bought != _batch_size:
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: buy count corrected"
+                                    f" {_batch_size}→{_mk_bought} from murk"
+                                    f" ({_mk_before:,}→{_mk_after:,},"
+                                    f" {_mk_delta:,} spent @ {_per_cost:,}/relic)")
+                                if self._diag:
+                                    try:
+                                        self._diag.log_buy_qty(
+                                            event="murk_reconcile",
+                                            cycle=_batch_i + 1,
+                                            expected=_batch_size,
+                                            got=_mk_bought,
+                                            cost=_mk_delta)
+                                    except Exception:
+                                        pass
+                                _batch_size = _mk_bought
+                                _advance_presses = max(0, _batch_size - 1)
+                        elif _mk_bought is not None and _mk_bought > _batch_size:
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: murk says {_mk_bought}"
+                                f" relic(s) bought but X/N said {_batch_size}"
+                                f" — keeping {_batch_size} (logged only)")
+                        else:
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: murk delta unusable"
+                                f" ({_mk_before:,}→{_mk_after:,}) — keeping X/N"
+                                f" count {_batch_size}")
                     if self._diag:
                         self._diag.phase_start(
                             f"Cycle {_batch_i + 1} Phase 2 (scan)",
@@ -11365,30 +11565,41 @@ class RelicBotApp(tk.Tk):
                                             except Exception:
                                                 pass
                             else:
-                                # End-of-list wrap fast-path: matched_idx == 0
-                                # after >=2 confirmed relics means the cursor
-                                # walked past the last real relic (buy-qty OCR
-                                # overcounted). Clamp and exit cleanly.
-                                if _matched_idx == 0 and _p2_confirmed >= 2:
-                                    self._log(
-                                        f"  Cycle {_batch_i + 1}: end-of-list wrap"
-                                        f" — buy_qty overcount detected,"
-                                        f" clamping batch_size {_batch_size}"
-                                        f"→{_p2_confirmed} (cycle complete)")
-                                    if self._diag:
-                                        try:
-                                            self._diag.log_advance(
-                                                cycle=_batch_i + 1,
-                                                idx=_p2_confirmed,
-                                                outcome="endwrap_clamp",
-                                                note=(f"old_batch={_batch_size}"
-                                                      f" new_batch={_p2_confirmed}"
-                                                      f" hist={len(_p2_crop_history)}"
-                                                      f" attempts={_p2_attempts}"))
-                                        except Exception:
-                                            pass
-                                    _batch_size = _p2_confirmed
-                                    break
+                                # A match on slot 0 means the cursor is back on
+                                # the FIRST relic of the cycle.  That has two
+                                # causes and they are indistinguishable here:
+                                #   • buy-qty OCR overcounted (a 10th relic was
+                                #     never bought), or
+                                #   • a RIGHT press double-stepped, so we walked
+                                #     PAST a real relic and wrapped to the start.
+                                #
+                                # v1.8.0 (e8908ee) assumed the first, clamped
+                                # _batch_size and broke out of the cycle —
+                                # shipped as "prevents lost relics on buy-qty
+                                # OCR overcount".  It did the opposite.  Slot 0
+                                # is the most likely landing spot for an
+                                # overshoot, so that fast-path caught the
+                                # DOUBLING case most of the time and dropped the
+                                # skipped relic, bypassing the recovery walk
+                                # v1.7.2 (7c3d89e) had already built for exactly
+                                # this.  Worse, setting _batch_size =
+                                # _p2_confirmed made found == expected, which
+                                # suppressed the "ended short / relic_lost"
+                                # reporting below — so the loss was invisible.
+                                #
+                                # Measured on batch_run_2026-08-08_010535:
+                                # 1,431 clamps, 1,920 relics bought and never
+                                # analysed (~6% of the run).  Confirmed by murk:
+                                # all 895,077 was spent, so those relics HAD
+                                # been purchased.  One of them was a 2/3 match.
+                                #
+                                # Slot 0 now takes the SAME recovery walk as
+                                # every other slot: keep pressing RIGHT until
+                                # the missed relic turns up.  _P2_MAX_ATTEMPTS
+                                # ends the cycle, and a genuine overcount simply
+                                # exhausts the budget and reports honestly.
+                                # LOAD-BEARING: do not re-add an early break
+                                # here without also keeping the loss visible.
                                 _p2_wraparound_hits += 1
                                 self._log(
                                     f"  Cycle {_batch_i + 1}: wraparound detected"
