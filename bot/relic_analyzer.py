@@ -1735,6 +1735,55 @@ def is_title_screen(image_bytes: bytes) -> tuple:
     return len(hits) >= 2, hits
 
 
+# A modal laid over the title screen REPLACES the menu block, so
+# is_title_screen() cannot see it — that is how the bot got stranded three
+# separate times.  Every such dialog observed so far carries a single OK
+# button in the lower-middle of the frame, and an OK button is self-defining:
+# if one is on screen we are on a dismissible dialog, not in the game world.
+#
+# Measured across four real failure-dump frames (2026-08-08):
+#   "Network status check failed"                 OK @ 0.86
+#   "...Return to Title Menu... loss of progress" OK @ 0.49
+#   "Starting in offline mode."                   OK @ 0.88 / 0.89
+# The equipment band was empty on only THREE of those four, which is why the
+# simpler "no text at all" rule was rejected — it would have missed one, and
+# it can also be true in the game world, where continued F-spam means talking
+# to NPCs.
+_DIALOG_BAND_FROM = 0.50
+_DIALOG_BAND_TO   = 0.75
+_DIALOG_OK_MIN_CONF = 0.40   # lowest observed was 0.49; leave a little room
+
+
+def is_dismissible_dialog(image_bytes: bytes) -> tuple:
+    """Is a dialog with an OK button on screen? Returns (bool, confidence).
+
+    Used by Phase -0.5 exactly like is_title_screen: while one of these is up
+    we are NOT in the world regardless of anything else, so State A holds and
+    F keeps firing — F is what dismisses them.  Confirmed in the field: across
+    27 launches on 2026-08-08 only 3 failed, and the other 24 got past the
+    same dialog because F-spam was still running when it appeared.
+
+    Matches the token exactly after normalising, so 'OK' cannot be satisfied
+    by a longer word that merely contains it.
+
+    NEVER RAISES. Phase -0.5 wraps its whole cycle in a try/except that logs
+    an OCR error and skips the rest of the cycle, so a detector that throws on
+    an odd frame silently takes the equipment check down with it and stalls
+    the boot. Returning (False, 0.0) degrades to the previous behaviour.
+    """
+    try:
+        toks = scan_text_tokens(image_bytes, top_fraction=_DIALOG_BAND_TO,
+                                from_fraction=_DIALOG_BAND_FROM)
+    except Exception:
+        return False, 0.0
+    best = 0.0
+    for t, c in toks:
+        norm = "".join(ch for ch in str(t).lower() if ch.isalnum())
+        if norm == "ok" and c >= _DIALOG_OK_MIN_CONF and c > best:
+            best = c
+    return best > 0.0, best
+
+
 def verify_shop_item(image_bytes: bytes, relic_type: str) -> tuple:
     """
     Confirm the highlighted shop item is the correct relic before Phase 1 runs.

@@ -5160,6 +5160,11 @@ class RelicBotApp(tk.Tk):
         _consecutive_black = 0
         _BLACK_SUSTAINED_THRESHOLD = 3
         _title_logged = False
+        # Initialised beside _title_logged, not first-assigned in the loop:
+        # the dialog branch reads it before any assignment on the path where a
+        # dialog is seen while _game_rendered is already False. Same
+        # unbindable-name class as v1.8.10.
+        _dialog_logged = False
 
         self._log("[Phase -0.5] Adaptive load wait — watching for in-game state…")
 
@@ -5314,6 +5319,37 @@ class RelicBotApp(tk.Tk):
                         # useful line in the log when this phase misbehaves.
                         _title_logged = True
                         self._log("[Phase -0.5] Title screen — pressing F to continue…")
+                    continue
+
+                # A modal laid OVER the title screen replaces the menu block, so
+                # is_title_screen() above cannot see it and every check below
+                # reads an empty frame. Three separate dialogs have stranded a
+                # run this way: "Network status check failed" (2026-08-08 run 1,
+                # died at iteration 67/200), the improper-session-end warning
+                # (run 2, died at iteration 5) and "Starting in offline mode."
+                # (run 3, killed batch 25 and cost iteration 8 twelve dumps).
+                #
+                # An OK button is self-defining: if one is on screen we are on a
+                # dismissible dialog, not in the world. Same treatment as the
+                # title menu — hold State A so F keeps firing, because F is what
+                # dismisses them. Field-confirmed: of 27 launches on the run that
+                # produced these frames, 24 sailed past the SAME dialog purely
+                # because F-spam was still running when it appeared; the 3 that
+                # failed had latched to State B first on a slow boot.
+                _is_dialog, _dlg_conf = relic_analyzer.is_dismissible_dialog(_img)
+                if _is_dialog:
+                    if _game_rendered:
+                        _game_rendered = False
+                        _dialog_logged = True
+                        self._log(
+                            f"[Phase -0.5] Dialog with an OK button "
+                            f"(conf {_dlg_conf:.2f}) — resuming F to dismiss "
+                            f"(had been treating this as the game world).")
+                    elif not _dialog_logged or _cycle % 8 == 0:
+                        _dialog_logged = True
+                        self._log(
+                            f"[Phase -0.5] Dialog with an OK button "
+                            f"(conf {_dlg_conf:.2f}) — pressing F to dismiss…")
                     continue
 
                 _equip_found = relic_analyzer.check_text_visible(
@@ -13482,7 +13518,17 @@ class RelicBotApp(tk.Tk):
     # Bound on unrecognised-screen dumps per run. Every failure of this class
     # repeats identically, so a handful of frames answers it; the cap exists so
     # a long run cannot quietly fill a disk with the same picture.
-    _FAILURE_DUMP_MAX = 12
+    #
+    # Raised 12 -> 40 on 2026-08-08. The cap is per RUN, and one bad episode
+    # spends all of it: iteration 8 of batch_run_2026-08-08_152627 burned all
+    # twelve in ninety seconds, so when batch 25 died of the SAME cause at the
+    # end of the run it produced no image at all. The failure that actually
+    # ends a run is the one most worth seeing, and it was the one we lost.
+    #
+    # A per-episode allowance would be better still, but the counter is reset
+    # per run and threading episode state through four call sites is more
+    # machinery than the problem deserves. 40 frames is ~3 MB.
+    _FAILURE_DUMP_MAX = 40
 
     def _dump_unrecognised_screen(self, reason: str, region=None,
                                   image: bytes = None, note: str = "") -> str:
