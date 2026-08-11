@@ -10494,6 +10494,14 @@ class RelicBotApp(tk.Tk):
                     }
 
             _buy_loop_done = False   # set True when "Insufficient murk" detected mid-cycle
+            # Murk total as of the end of the last completed cycle.  The buy-count
+            # reconciliation already reads this after every cycle (_mk_after);
+            # carrying it forward is what lets a mid-iteration recovery prove
+            # nothing was bought while the bot was lost.  Seeded from the Phase 0
+            # read because _mk_after is not bound until the first reconciliation
+            # runs, and a cycle-1 failure reaches the recovery before that —
+            # iteration 24 of batch_run_2026-08-10_120047 did exactly that.
+            _murk_expected_now = self._global_murk_expected or 0
             for _batch_i in range(_buy_count):
                 if _buy_loop_done:
                     break
@@ -10782,18 +10790,178 @@ class RelicBotApp(tk.Tk):
                             break
 
                     if not _qty_ok:
-                        # Q retries exhausted → ESC reset + Phase 0 replay + one final retry
-                        self._log(
-                            f"  Cycle {_batch_i + 1}: Q retries exhausted —"
-                            f" ESC reset + Phase 0 + retry")
-                        self._esc_to_game_screen(region)
-                        if self.phase_events[0]:
-                            self.player.play(
-                                self.phase_events[0],
-                                extra_delay=_p02_extra_delay)
-                            # Brief settle before re-attempting buy
-                            time.sleep((3.0 if _lpm else 1.5)
-                                       * max(1.0, self._perf_gap_mult))
+                        # Q retries exhausted → soft reset.  NOTHING has been
+                        # bought on this cycle: the confirm F only fires after a
+                        # clean quantity read, so resetting here cannot cost a
+                        # relic.  Checked against batch_run_2026-08-10_120047 —
+                        # all six occurrences had cycles-completed exactly equal
+                        # to the ledger row count.
+                        #
+                        # LOAD-BEARING: never buy after a Phase 0 replay without
+                        # confirming we arrived.  This path used to replay, sleep
+                        # a fixed 1.5-3 s and press E blind; when the replay did
+                        # not land, the dialog was never on screen, X/N/cost all
+                        # read None, and that was reported as "shop likely empty"
+                        # with ~290 relics of stock left.  The sibling recovery
+                        # ("relic screen not found", below) has always polled for
+                        # the shop before retrying — this one never did.
+                        _SOFT_RESET_MAX     = 2
+                        _reset_ok           = False
+                        _reset_why          = "not attempted"
+                        _depleted_confirmed = False
+                        _mv                 = 0
+                        for _sr in range(_SOFT_RESET_MAX):
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: Q retries exhausted —"
+                                f" soft reset {_sr + 1}/{_SOFT_RESET_MAX}"
+                                f" (ESC + Phase 0)")
+                            self._esc_to_game_screen(region)
+                            if self.phase_events[0]:
+                                self.player.play(
+                                    self.phase_events[0],
+                                    extra_delay=_p02_extra_delay)
+                                # Brief settle before re-attempting buy
+                                time.sleep((3.0 if _lpm else 1.5)
+                                           * max(1.0, self._perf_gap_mult))
+                            if not self.bot_running or self._reset_iter_requested:
+                                self._set_ocr_throttle(False)
+                                if (not self.bot_running and capture_only
+                                        and not _p2_async):
+                                    return _bl_captures
+                                return relic_results
+
+                            # ── 1. back on the shop screen at all? ──────────── #
+                            # Same predicate and same 4 s budget as the sibling
+                            # recovery path.
+                            _shop_back_q = False
+                            for _sw in range(20):
+                                if (not self.bot_running
+                                        or self._reset_iter_requested):
+                                    self._set_ocr_throttle(False)
+                                    if (not self.bot_running and capture_only
+                                            and not _p2_async):
+                                        return _bl_captures
+                                    return relic_results
+                                try:
+                                    _sw_img = screen_capture.capture(region)
+                                    if relic_analyzer.check_text_visible(
+                                            _sw_img, "small jar bazaar",
+                                            top_fraction=0.15):
+                                        _shop_back_q = True
+                                        break
+                                except Exception:
+                                    pass
+                                time.sleep(0.20)
+                            if not _shop_back_q:
+                                _reset_why = "shop screen not re-detected"
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}")
+                                continue
+
+                            # ── 2. sitting on the RIGHT item? ───────────────── #
+                            # verify_shop_item checks the tooltip name, the
+                            # Deep/normal token position, and the '1.02'
+                            # old-version marker in the description.  Buying off
+                            # the wrong item is how a false positive would reach
+                            # the results.
+                            try:
+                                _iv_img = screen_capture.capture(region)
+                                _item_ok, _item_why = (
+                                    relic_analyzer.verify_shop_item(
+                                        _iv_img, self.relic_type_var.get()))
+                            except Exception as _ive:
+                                _item_ok = False
+                                _item_why = f"verify error: {_ive}"
+                            if not _item_ok:
+                                _reset_why = f"wrong shop item ({_item_why})"
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}")
+                                continue
+
+                            # ── 3. is the murk total where we left it? ──────── #
+                            # _murk_expected_now is the post-buy total the
+                            # reconciliation already reads at the end of every
+                            # cycle.  If it moved while the bot was lost then
+                            # something was bought that we never asked for, and
+                            # buying on top of that would compound it.
+                            try:
+                                _mv_img = screen_capture.capture(region)
+                                _mv, _ = relic_analyzer.read_murk(
+                                    _mv_img, region=self._murk_region)
+                            except Exception as _mve:
+                                _mv = 0
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: murk re-check"
+                                    f" error: {_mve}")
+                            if not _mv or _mv <= 0:
+                                _reset_why = "murk unreadable on the shop screen"
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}")
+                                continue
+                            if _murk_expected_now and _mv != _murk_expected_now:
+                                _reset_why = (
+                                    f"murk moved while recovering"
+                                    f" ({_murk_expected_now:,} → {_mv:,},"
+                                    f" {_murk_expected_now - _mv:,} spent)")
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}"
+                                    f" — something was bought that we did not"
+                                    f" ask for; not buying again")
+                                break
+                            if _mv < murk_cost:
+                                # Genuinely out of murk.  This is the ONLY test
+                                # allowed to conclude end-of-stock — measured,
+                                # never inferred from an empty OCR read.
+                                _depleted_confirmed = True
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: shop re-verified"
+                                f" — murk {_mv:,}")
+                            _reset_ok = True
+                            break
+
+                        if _depleted_confirmed:
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: murk exhausted"
+                                f" ({_mv:,} < {murk_cost:,}) after {_batch_i}"
+                                f" cycle(s) — ending iteration")
+                            if self._diag:
+                                try:
+                                    self._diag.log_buy_qty(
+                                        event="shop_depleted",
+                                        cycle=_batch_i + 1,
+                                        expected=_batch_size,
+                                        got=0, n_cap=0, conf=0.0, cost=0)
+                                except Exception:
+                                    pass
+                            if _exclude_buy_phase:
+                                self._set_ocr_throttle(False)
+                            _p1_ok = True
+                            _buy_loop_done = True
+                            break   # break _p1_try loop
+
+                        if not _reset_ok:
+                            # Recovery failed.  Do NOT press E into whatever is
+                            # on screen — pressing keys while lost is how the bot
+                            # ends up interacting with the wrong thing.  Abort
+                            # the iteration and say why.
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: could not get back to"
+                                f" the shop after {_SOFT_RESET_MAX} soft"
+                                f" reset(s) — {_reset_why} — aborting iteration")
+                            if self._diag:
+                                try:
+                                    self._diag.log_buy_qty(
+                                        event="unrecoverable",
+                                        cycle=_batch_i + 1,
+                                        expected=_batch_size,
+                                        got=0, n_cap=0, conf=0.0, cost=0)
+                                except Exception:
+                                    pass
+                            self._set_ocr_throttle(False)
+                            if _p2_async:
+                                self._async_iter_abort_cleanup(
+                                    iteration, _p2_submitted)
+                            return relic_results
 
                         _do_buy_open_and_select()
                         if not self.bot_running or self._reset_iter_requested:
@@ -10827,27 +10995,27 @@ class RelicBotApp(tk.Tk):
                                     pass
                             _qty_ok = True
                         else:
-                            # Distinguish shop-depleted (expected, graceful
-                            # end of iteration when stock runs out) from
-                            # genuine unrecoverable (dialog opened but OCR
-                            # read garbage — real bug or game bug).
-                            _shop_depleted = (
-                                (_qty_x is None or _qty_x == 0)
-                                and (_qty_n is None or _qty_n == 0)
-                                and (not _qty_cost)
-                            )
-                            if _shop_depleted:
-                                self._log(
-                                    f"  Cycle {_batch_i + 1}: shop likely"
-                                    f" empty ({_batch_i} cycles completed)"
-                                    f" — ending iteration gracefully")
-                                _event = "shop_depleted"
-                            else:
-                                self._log(
-                                    f"  Cycle {_batch_i + 1}: ESC reset retry"
-                                    f" also failed (got {_qty_x}/{_qty_n})"
-                                    f" — aborting iteration")
-                                _event = "unrecoverable"
+                            # Getting here means the shop screen AND the shop
+                            # item were verified moments ago and the murk total
+                            # was exactly where we left it, so an unreadable buy
+                            # dialog is a genuine failure.  Depletion is decided
+                            # from the murk total alone, in the soft-reset block
+                            # above.
+                            #
+                            # LOAD-BEARING: do NOT reinstate the old rule that
+                            # x/n/cost all reading None means "shop likely
+                            # empty".  An all-None read is the signature of the
+                            # dialog not being on screen at all — the murk crop
+                            # in those dumps is a stone wall.  That rule ended 6
+                            # iterations of batch_run_2026-08-10_120047 between
+                            # cycle 1 and cycle 11 of 31, each with ~290 relics
+                            # of stock still on the shelf, and logged every one
+                            # of them as a graceful success.
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: ESC reset retry"
+                                f" also failed (got {_qty_x}/{_qty_n})"
+                                f" — aborting iteration")
+                            _event = "unrecoverable"
                             if self._diag:
                                 try:
                                     self._diag.log_buy_qty(
@@ -11339,6 +11507,20 @@ class RelicBotApp(tk.Tk):
                     # it must never be the divisor when the real cost is known.
                     _per_cost = murk_cost or getattr(
                         self, "_per_relic_murk_cost", None)
+                    # Hoisted out of the branch below so every path can read
+                    # them: a cycle that skips reconciliation (no settle frame)
+                    # would otherwise leave these unbound — the v1.8.10
+                    # unbindable-name class.
+                    _mk_before = _mk_after = 0
+                    _mk_delta = 0
+                    # Invalidate the carried murk expectation up front.  It is
+                    # only trustworthy when the reconciliation below actually
+                    # runs; a cycle that skips it still spends murk, so a stale
+                    # value would make the NEXT cycle's soft reset report
+                    # "murk moved while recovering" and abort a perfectly
+                    # recoverable iteration.  0 means "unknown", and the
+                    # soft-reset check skips rather than guesses.
+                    _murk_expected_now = 0
                     if (_per_cost and _per_cost > 0
                             and _qty_jpeg is not None
                             and _settle_img is not None):
@@ -11351,6 +11533,15 @@ class RelicBotApp(tk.Tk):
                         except Exception:
                             pass
                         _mk_delta = (_mk_before or 0) - (_mk_after or 0)
+                        # Carry the true post-buy total forward for the
+                        # soft-reset murk check.  Guarded on a real read so a
+                        # failed OCR cannot poison the expectation with 0.
+                        # Kept here, at the point the value is actually measured,
+                        # rather than anywhere further down the cycle — the
+                        # soft-reset check is worthless if the expectation is
+                        # set on some paths and not others.
+                        if _mk_after:
+                            _murk_expected_now = _mk_after
                         _mk_bought = None
                         if _mk_delta > 0 and _mk_delta % _per_cost == 0:
                             _mk_bought = _mk_delta // _per_cost
