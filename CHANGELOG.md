@@ -4,6 +4,31 @@ All notable changes to this project are documented here.
 
 ---
 
+## [1.9.2] — 2026-08-11 — RELICS YOU PAID FOR ARE NO LONGER THROWN AWAY
+
+### Fixed: the bot bought relics it never looked at — around 6% of every run since 1.8.0
+- If you have ever finished a run, gone through the save by hand and found a relic that matched your criteria but was never reported, this is why. It was bought and never scanned. Not an OCR miss and not a categorisation miss — the bot simply never looked at it.
+- Cause: when the cursor wrapped back to the first relic of a batch, the bot had two possible explanations — either it had been told to buy more relics than it really did, or a keypress had double-stepped and skipped past one. It already had a working recovery for the second case. Instead it assumed the first, quietly lowered its own expectation to match what it had seen, and moved on.
+- Lowering the expectation is what hid it. The bot compares what it found against what it expected in order to warn you when relics go missing — and by rewriting the expectation first, that warning could never fire. **Every affected run reported complete success.** One measured run bought 1,920 relics it never scanned and said nothing.
+- The bot now walks the list to find the relic it skipped, exactly as it already did for every other case.
+- **A second, independent check was added on top**: the bot reads your murk total before and after each purchase, and the amount actually deducted tells it precisely how many relics it just bought. That number is established *before* scanning starts, while the relics are still reachable — knowing you missed one after the shop closes is worth nothing.
+- Measured across two validation runs after the fix: **every relic bought was scanned**, with the recovery engaging on roughly a third of all buy cycles and succeeding every time.
+
+### Fixed: a dialog over the title screen could strand a run
+- Runs could stop with the bot sitting at the title screen behind a pop-up — "Network status check failed", the warning about a previous session ending improperly, or "Starting in offline mode".
+- These pop-ups cover the title menu, so the bot could not see the menu it was looking for and concluded it had reached the game. It then stopped pressing the key that dismisses the pop-up.
+- The bot now recognises that a dismissible dialog is on screen and keeps pressing to clear it — the same handling the title screen itself already gets.
+
+### Fixed: the launch failsafe started Steam and the game at the same time
+- After three failed launch attempts the bot falls back to restarting Steam. It was waiting 30 seconds for a Steam process that nothing had started yet, then launching through a link that starts Steam *and* queues the game together.
+- The game would reach its network check before Steam had finished signing in and stop on "Network status check failed" — turning a recoverable launch failure into a dead run.
+- Steam is now started on its own, and the bot waits until Steam is genuinely ready before launching the game.
+
+### Changed
+- The bot keeps more diagnostic snapshots per run (12 → 40). A single bad episode could previously use the whole allowance, leaving nothing recorded for the failure that actually ended the run.
+
+---
+
 ## [1.9.1] — 2026-08-07 — RUNS NO LONGER STOP AFTER THE FIRST ITERATION
 
 ### Fixed: the bot could get stranded on the title screen and never recover
