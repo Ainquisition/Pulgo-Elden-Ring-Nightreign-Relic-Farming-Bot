@@ -4,6 +4,30 @@ All notable changes to this project are documented here.
 
 ---
 
+## [1.9.3] — 2026-08-12 — PICK RELIC COLORS PER TARGET
+
+### Added: each target, pairing and pool chooses its own relic colors
+- The color filter used to be a single run-wide setting on the main tab. It could only ever say "these colors for everything", so asking for a Red version of one build and a Blue version of another was impossible.
+- Colors now live in the Relic Criteria tabs. Every Build Exact Relic target has its own gems, every pairing has its own in the Create/Edit Pairing dialog, and the passive pool has its own for pool entries. Click a gem to include or exclude that color; at least one must stay selected.
+- Combine mode runs both tabs' criteria side by side and does not merge their color selections.
+- A target that is restricted shows a marker in the target list, so you can see it without opening the target.
+
+### Changed: colors apply to hits only
+- Near misses and Smart Analyze results are reported in every color, so narrowing a target's colors never hides the near misses that tell you how close a roll was.
+- When a relic has the right passives but the wrong color, the log names the colors that target accepts and the run's diagnostics count it. A color filter that is quietly costing you relics is now visible instead of being an invisible non-match.
+
+### Fixed: the odds panel now accounts for colors, and the total is a real total
+- Odds are priced per target at that target's own colors. The Combine-mode view rebuilt its own numbers and had been ignoring colors entirely.
+- The breakdown gains a line stating what a color selection costs, for example "Colour (Red) -> 25.00% of relics (x0.25 on the odds shown)". It only appears when fewer than four colors are selected.
+- A TOTAL line is always shown. It used to appear only once you had two or more targets.
+- The Combine-mode total is now computed the same way the bot decides a match. It previously asked for several pairings to land on one relic at once and could report a total rarer than the group it was summarising.
+- Percentages keep three significant digits instead of one, so small odds can be compared and divided. Odds like 0.0060% and 0.0015% used to print as "0.01%" and "0.002%" — a 4x difference that read as 5x.
+
+### Compatibility
+- Profiles saved before this version keep their color filter: the old run-wide selection seeds every target, pairing and pool that does not have colors of its own. Profiles that had all four colors selected behave exactly as before.
+
+---
+
 ## [1.9.2] — 2026-08-11 — RELICS YOU PAID FOR ARE NO LONGER THROWN AWAY
 
 ### Fixed: the bot bought relics it never looked at — around 6% of every run since 1.8.0

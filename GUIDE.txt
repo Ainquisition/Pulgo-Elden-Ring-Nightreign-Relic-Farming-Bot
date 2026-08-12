@@ -1,5 +1,5 @@
 ================================================================================
-  RELIC BOT v1.9.2
+  RELIC BOT v1.9.3
   Elden Ring Nightreign Relic Farming Bot
   Made by Pulgo
 ================================================================================
@@ -409,8 +409,31 @@ automatically when you switch relic types.
 
 RELIC COLOR FILTER
   Each relic has a color (Red/Burning, Blue/Drizzly, Green/Tranquil,
-  Yellow/Luminous). Click the gem images or checkboxes to deselect colors
-  you don't care about. Only matching colors will count as hits.
+  Yellow/Luminous).
+
+  Colors are chosen in the Relic Criteria tabs, and each one keeps its own
+  selection:
+
+    - Build Exact Relic  one set of colors per target, under the slots
+    - Pairings           one set per pairing, in the Create/Edit dialog
+    - Passive Pool       one set for the pool entries
+
+  Click a gem to include or exclude that color. At least one color must
+  stay selected. A target only counts a relic as a hit when the relic is
+  one of that target's colors, so you can hunt a Red version of one build
+  and a Blue version of another in the same run.
+
+  Combine mode runs both tabs' criteria side by side and does not merge
+  their color selections.
+
+  Colors apply to hits only. Near misses and Smart Analyze results are
+  reported in every color. When a relic has the right passives but the
+  wrong color, the log says so and names the colors that target accepts,
+  so you can tell whether a filter is costing you relics.
+
+  The odds panel shows what a color selection costs — for example
+  "Colour (Red) -> 25.00% of relics (x0.25 on the odds shown)" — and only
+  appears when fewer than four colors are selected.
 
 
 ================================================================================
