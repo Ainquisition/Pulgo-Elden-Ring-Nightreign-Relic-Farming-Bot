@@ -6,12 +6,22 @@ match.  Doors are generated from the user's criteria (exact targets, pool
 entries, pairings) at UI change time and stored in memory.  During analysis
 each relic is simply compared against the door list — no runtime logic needed.
 
-Each door is a tuple:  (frozenset[str], str)
+Each door is a tuple:  (frozenset[str], str, frozenset[str] | None)
   - frozenset of passive names the relic must contain (ALL must be present)
   - source label for debugging ("exact", "pool", "pairing")
+  - the relic colours this door accepts, or None for "any colour"
 
 The tier of a match = number of passives in the door (1, 2, or 3).
 GOD ROLL = door with 3 passives matched.  HIT = door with 1 or 2 matched.
+
+Colours are carried PER DOOR, not globally.  Each exact target, each pool
+entry set and each pairing chooses its own colours in the builder, and those
+travel with the doors that target produced.  Combine mode generates both
+modes' doors side by side — it does NOT merge their colour selections.
+
+Colours gate full matches only.  Near misses and Smart Analyze doors are
+never colour-filtered (Pulgo, 2026-08-12), so a smart door remains a plain
+2-tuple and `check_doors` accepts both shapes.
 """
 
 from __future__ import annotations
@@ -34,6 +44,43 @@ if TYPE_CHECKING:
 # generate_doors call and reads it afterward to populate the
 # `compat_rejects` diagnostic counter.
 _compat_reject_count: int = 0
+
+
+RELIC_COLORS: tuple[str, ...] = ("Red", "Blue", "Green", "Yellow")
+_ALL_COLORS: frozenset[str] = frozenset(RELIC_COLORS)
+
+
+def norm_colors(raw) -> frozenset[str] | None:
+    """Normalise a colour selection to a frozenset, or None for unrestricted.
+
+    None is returned for "all four selected" as well as for missing/empty
+    input.  Collapsing all-four to None means a user who never touches the
+    colour toggles produces doors identical to the pre-colour behaviour, and
+    the whole feature costs nothing at match time for them.
+
+    Empty fails OPEN (unrestricted) rather than matching nothing: the UI
+    enforces a one-colour minimum, so an empty set here means a hand-edited
+    or pre-feature profile, and refusing every relic would look like a dead
+    bot rather than a bad setting.
+    """
+    if not raw:
+        return None
+    picked = frozenset(c for c in raw if c in _ALL_COLORS)
+    if not picked or picked == _ALL_COLORS:
+        return None
+    return picked
+
+
+def _merge_colors(a: frozenset | None, b: frozenset | None) -> frozenset | None:
+    """Union two door colour sets.  None (any colour) absorbs everything.
+
+    Used when the same passive set is reachable from two targets with
+    different colours — the relic is a valid match under either, so the
+    surviving door must accept both.
+    """
+    if a is None or b is None:
+        return None
+    return a | b
 
 
 def reset_compat_reject_count() -> None:
@@ -85,10 +132,13 @@ def _doors_from_exact(criteria: dict, pool: frozenset[str]) -> list[tuple[frozen
         threshold = target.get("threshold", 2)
         if len(passives) < threshold:
             continue
+        # Each target carries its own colours; every door it emits inherits
+        # them.  Read per target, never from a run-wide setting.
+        colors = norm_colors(target.get("colors"))
         # Generate all threshold-sized subsets
         for combo in itertools.combinations(passives, threshold):
             if _variants_compat(list(combo)):
-                doors.append((frozenset(combo), "exact"))
+                doors.append((frozenset(combo), "exact", colors))
     return doors
 
 
@@ -106,6 +156,9 @@ def _doors_from_pool_entries(criteria: dict, pool: frozenset[str]) -> list[tuple
     """
     entries = criteria.get("entries", [])
     threshold = criteria.get("threshold", 2)
+    # The pool tab's own colour selection — independent of the exact tab's
+    # per-target colours, and never combined with them.
+    colors = norm_colors(criteria.get("colors"))
 
     # Collect accepted lists, filtering to mode-valid passives
     entry_options: list[list[str]] = []
@@ -134,7 +187,7 @@ def _doors_from_pool_entries(criteria: dict, pool: frozenset[str]) -> list[tuple
                 continue
             if _variants_compat(combo_list):
                 seen.add(fs)
-                doors.append((fs, "pool"))
+                doors.append((fs, "pool", colors))
 
     return doors
 
@@ -155,6 +208,10 @@ def _doors_from_pairings(criteria: dict, pool: frozenset[str]) -> list[tuple[fro
     seen: set[frozenset] = set()
 
     for pairing in criteria.get("pairings", []):
+        # A pairing picks its own colours in the Create/Edit Pairing dialog.
+        # It does NOT inherit the pool tab's selection — a pairing saved
+        # before this feature has no colours and stays unrestricted.
+        pair_colors = norm_colors(pairing.get("colors"))
         left  = [p for p in pairing.get("left",  []) if p in pool]
         right = [p for p in pairing.get("right", []) if p in pool]
         c_pool = [p for p in pairing.get("pool",  []) if p in pool]
@@ -182,7 +239,7 @@ def _doors_from_pairings(criteria: dict, pool: frozenset[str]) -> list[tuple[fro
                 continue
             if _variants_compat(combo_list):
                 seen.add(fs)
-                doors.append((fs, "pairing"))
+                doors.append((fs, "pairing", pair_colors))
 
     return doors
 
@@ -220,13 +277,27 @@ def generate_doors(criteria: dict, relic_type: str = "night") -> list[tuple[froz
     else:
         doors = []
 
-    # Deduplicate (same passive set from different sources — keep first)
-    seen: set[frozenset] = set()
-    unique = []
+    # Deduplicate (same passive set from different sources — keep the first
+    # source label, but UNION the colours).
+    #
+    # LOAD-BEARING: keep-first would silently discard a colour.  Target 1
+    # [Red] and target 2 [Blue] can produce the identical passive set; that
+    # relic is a legitimate match in either colour, so the surviving door has
+    # to accept {Red, Blue}.  Dropping target 2's colours here would look
+    # exactly like the bot ignoring a target the user configured.
+    merged: dict[frozenset, list] = {}
+    order: list[frozenset] = []
     for door in doors:
-        if door[0] not in seen:
-            seen.add(door[0])
-            unique.append(door)
+        fs     = door[0]
+        source = door[1]
+        colors = door[2] if len(door) > 2 else None
+        if fs not in merged:
+            merged[fs] = [fs, source, colors]
+            order.append(fs)
+        else:
+            merged[fs][2] = _merge_colors(merged[fs][2], colors)
+
+    unique = [tuple(merged[fs]) for fs in order]
 
     # Sort: largest doors first (3 > 2 > 1) for early best-match
     unique.sort(key=lambda d: len(d[0]), reverse=True)
@@ -596,7 +667,9 @@ def get_3_passive_doors(doors: list[tuple[frozenset, str]]) -> list[frozenset]:
 
 def check_doors(
     relic_passives: list[str],
-    doors: list[tuple[frozenset, str]],
+    doors: list[tuple],
+    relic_color: str | None = None,
+    color_blocked: list | None = None,
 ) -> tuple[bool, list[str], list[dict]]:
     """Check a relic's passives against pre-computed doors.
 
@@ -609,6 +682,19 @@ def check_doors(
 
     The relic's tier = len(matched_passives) from the best door:
       3 = GOD ROLL, 2 = HIT, 1 = HIT (only if a 1-passive door exists)
+
+    Args:
+        relic_color:   "Red"/"Blue"/"Green"/"Yellow", or None when the colour
+                       could not be read.  None FAILS OPEN — an unreadable
+                       name must not silently throw away real matches.
+        color_blocked: optional list; passive sets that satisfied a door but
+                       failed its colour are appended here so the caller can
+                       report what the filter cost.  Kept as an out-parameter
+                       rather than a 4th return value because ~680 existing
+                       checks unpack this call as a 3-tuple.
+
+    Doors may be 2-tuples (passives, source) or 3-tuples with a colour set.
+    Smart Analyze doors are never colour-filtered and stay 2-tuples.
     """
     relic_set = set(relic_passives)
     relic_count = len(relic_passives)
@@ -616,13 +702,25 @@ def check_doors(
     best_match: list[str] = []
     near_misses: list[dict] = []
 
-    for door_passives, source in doors:
+    for door in doors:
+        door_passives = door[0]
+        door_colors   = door[2] if len(door) > 2 else None
         door_size = len(door_passives)
 
         # Early exit: skip doors requiring more passives than relic has
         hits = door_passives & relic_set
 
         if len(hits) == door_size:
+            # Passives satisfied — now the door's own colours decide.
+            if (door_colors is not None and relic_color is not None
+                    and relic_color not in door_colors):
+                if color_blocked is not None:
+                    color_blocked.append({
+                        "passives": sorted(hits),
+                        "colors":   sorted(door_colors),
+                    })
+                # Do NOT break/return: another door may accept this colour.
+                continue
             # Full match — keep if better than current best
             if door_size > len(best_match):
                 best_match = sorted(hits)
@@ -631,6 +729,9 @@ def check_doors(
                     break
         elif len(hits) == 2 and door_size == 3:
             # Near miss: 2 of 3 from a 3-passive door (includes Polished relics)
+            # Deliberately NOT colour-filtered — colours gate HIT/GOD ROLL
+            # only, so a near miss is reported in any colour (Pulgo,
+            # 2026-08-12).  Do not "tidy" this by adding the colour check.
             near_misses.append({
                 "relic_name": "current relic",
                 "matching_passive_count": 2,

@@ -1401,27 +1401,38 @@ def analyze(
     relic_name, passives, curses, _dbg_tokens = _ocr_by_slots(
         img, reader, ALL_PASSIVES_SORTED, ALL_CURSES, relic_type)
 
-    # Color detection
-    allowed_colors = criteria.get("allowed_colors", [])
-    if allowed_colors and len(allowed_colors) < 4:
-        relic_color = _detect_relic_color(relic_name or "")
-        if relic_color and relic_color not in allowed_colors:
-            return {
-                "relics_found": [{"name": relic_name, "passives": passives, "curses": curses}],
-                "match": False,
-                "matched_relic": None,
-                "matched_passives": [],
-                "matched_relic_curses": [],
-                "near_misses": [],
-                "reason": f"Relic color '{relic_color}' not in allowed colors",
-                "_ocr_tokens": _dbg_tokens,
-            }
+    # Colour detection.  Colours now live PER DOOR (per exact target, per
+    # pool, per pairing) rather than as one run-wide filter, so the relic's
+    # colour is carried into the door check instead of gating the whole relic
+    # up front.  A colour that cannot be read is passed as None and fails
+    # open inside check_doors.
+    relic_color = _detect_relic_color(relic_name or "")
 
     # Criteria matching
+    color_blocked: list = []
     if doors is not None:
         from bot.door_generator import check_doors
-        match, matched_passives, near_misses = check_doors(passives, doors)
+        match, matched_passives, near_misses = check_doors(
+            passives, doors, relic_color=relic_color, color_blocked=color_blocked)
     else:
+        # Legacy runtime-criteria path (doors=None).  It has no per-door
+        # colours, so the old run-wide filter is preserved here and ONLY
+        # here — removing it would make this path silently colour-blind.
+        allowed_colors = criteria.get("allowed_colors", [])
+        if allowed_colors and len(allowed_colors) < 4:
+            if relic_color and relic_color not in allowed_colors:
+                return {
+                    "relics_found": [{"name": relic_name, "passives": passives, "curses": curses}],
+                    "match": False,
+                    "matched_relic": None,
+                    "matched_passives": [],
+                    "matched_relic_curses": [],
+                    "near_misses": [],
+                    "relic_color": relic_color,
+                    "color_blocked": [],
+                    "reason": f"Relic color '{relic_color}' not in allowed colors",
+                    "_ocr_tokens": _dbg_tokens,
+                }
         match, matched_passives, near_misses = _check_criteria(passives, criteria)
     for _nm in near_misses:
         if _nm.get("relic_name") == "current relic" and relic_name:
@@ -1434,10 +1445,18 @@ def analyze(
         "matched_passives": matched_passives,
         "matched_relic_curses": curses if match else [],
         "near_misses": near_misses,
+        "relic_color": relic_color,
+        # Passive sets that satisfied a door and were rejected on colour
+        # alone.  Reported by the caller so a colour filter that is quietly
+        # costing real relics is visible rather than an invisible DUD.
+        "color_blocked": color_blocked,
         "reason": (
             f"Found {len(matched_passives)} matching passive(s)"
             if match else
-            f"No match — {len(passives)} passive(s) detected"
+            (f"Passives matched but colour '{relic_color}' is not accepted "
+             f"by that target ({len(color_blocked)} blocked)"
+             if color_blocked else
+             f"No match — {len(passives)} passive(s) detected")
         ),
         "_ocr_tokens": _dbg_tokens,
     }

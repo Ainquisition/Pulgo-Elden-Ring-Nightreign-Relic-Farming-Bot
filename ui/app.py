@@ -784,8 +784,6 @@ class RelicBotApp(tk.Tk):
         self._clean_cycles_since_suppress = 0
         self._iter_suppress_count        = 0
         self._p3_consecutive_fails       = 0
-        self._prev_colors: set = {"Red", "Blue", "Green", "Yellow"}
-        self._color_warn_job = None   # after() job for warning auto-dismiss
         self._mouse_blocker_hook   = None   # WH_MOUSE_LL hook handle
         self._mouse_blocker_cb     = None   # keep-alive for hook callback (prevent GC)
         self._mouse_blocker_thread = None   # daemon thread running hook message pump
@@ -844,7 +842,7 @@ class RelicBotApp(tk.Tk):
                 else:
                     self._curse_frame.grid_remove()
             self._update_curse_odds()
-            self.relic_builder.set_relic_context(rtype, self._get_allowed_colors())
+            self.relic_builder.set_relic_context(rtype)
         self.after(0, _apply_post_load_ui)
         self.after(200, self._log_screen_resolution)
         self.after(300, self._log_calibration_status)
@@ -1048,8 +1046,6 @@ class RelicBotApp(tk.Tk):
         type_color_frame = ttk.LabelFrame(inner, text="Choose Relic Type")
         type_color_frame.grid(row=2, column=0, sticky="ew", **pad)
 
-        self._gem_mode_var = tk.StringVar(value="don")   # driven by relic_type_var; used by _refresh_gem_images
-
         rtype_row = ttk.Frame(type_color_frame)
         rtype_row.pack(anchor="w", padx=6, pady=(6, 4))
         ttk.Radiobutton(rtype_row, text="Deep of Night  (1800 murk each)",
@@ -1065,40 +1061,17 @@ class RelicBotApp(tk.Tk):
 
         ttk.Separator(type_color_frame, orient="horizontal").pack(fill="x", padx=6, pady=(0, 4))
 
+        # Colour selection lives in the Relic Criteria tabs now — one set per
+        # exact target, one for the passive pool, and one per pairing.  The
+        # old run-wide filter that sat here could only express "these colours
+        # for everything", which made per-target colour combos impossible.
         ttk.Label(
             type_color_frame,
-            text="Select which relic colors you are hunting for. At least one color must be enabled.",
+            text=("Relic colours are chosen in the Relic Criteria tabs: per target in "
+                  "Build Exact Relic, per pairing, and for the passive pool. "
+                  "Red = Burning, Blue = Drizzly, Green = Tranquil, Yellow = Luminous."),
             foreground=theme.TEXT_MUTED, wraplength=700,
-        ).pack(anchor="w", padx=6, pady=(0, 2))
-
-        RELIC_COLORS = ["Red", "Blue", "Green", "Yellow"]
-        color_row = ttk.Frame(type_color_frame)
-        color_row.pack(fill="x", padx=6, pady=(0, 6))
-        self._color_vars:     dict[str, tk.BooleanVar] = {}
-        self._gem_img_labels: dict[str, tk.Label]      = {}
-
-        for color in RELIC_COLORS:
-            var = tk.BooleanVar(value=True)
-            self._color_vars[color] = var
-
-            cell = ttk.Frame(color_row)
-            cell.pack(side="left", padx=10)
-
-            img_lbl = tk.Label(cell, bg=theme.SURFACE, cursor="hand2")
-            img_lbl.pack()
-            img_lbl.bind("<Button-1>", lambda _e, c=color: self._toggle_color(c))
-            self._gem_img_labels[color] = img_lbl
-
-            ttk.Checkbutton(cell, text=color, variable=var,
-                            command=self._on_color_change).pack()
-
-        _Tooltip(color_row, "Relics are identified by a keyword in their name:\nRed = Burning, Blue = Drizzly, Green = Tranquil, Yellow = Luminous.\nDeselect colors you don't want — only matching colors will count as hits.")
-
-        self._color_warn = ttk.Label(type_color_frame, text="", foreground="#ff6666")
-        self._color_warn.pack(anchor="w", padx=6)
-
-        # Populate gem images after widget hierarchy is ready
-        self.after(0, self._refresh_gem_images)
+        ).pack(anchor="w", padx=6, pady=(0, 6))
 
         # ── Sequence Phases ──────────────────────────────────────────── #
         seq_frame = ttk.LabelFrame(inner, text="Sequence Phases")
@@ -2797,8 +2770,6 @@ class RelicBotApp(tk.Tk):
             self._switching_mode = False
 
         # Phase 0 sequence swap
-        self._gem_mode_var.set("don" if rtype == "night" else "normal")
-        self._refresh_gem_images()
         fname = ("phase0_setup_don.json" if rtype == "night"
                  else "phase0_setup_normal.json")
         path = os.path.join(self._SEQ_DIR, fname)
@@ -2814,8 +2785,8 @@ class RelicBotApp(tk.Tk):
                 self._log(f"WARNING: Could not load Phase 0 for"
                           f" '{rtype}': {e}")
 
-        # Update UI context
-        self.relic_builder.set_relic_context(rtype, self._get_allowed_colors())
+        # Update UI context (gem art in the criteria tabs follows relic type)
+        self.relic_builder.set_relic_context(rtype)
         if hasattr(self, "_curse_frame"):
             if rtype == "night":
                 self._curse_frame.grid()
@@ -4018,7 +3989,8 @@ class RelicBotApp(tk.Tk):
                              for k, v in md.items()}
                          for m, md in self._mode_data.items()},
             "save_exclusion_matches": self._save_exclusion_matches_var.get(),
-            "allowed_colors": self._get_allowed_colors(),
+            # No "allowed_colors" — colours are per target / pairing / pool and
+            # travel inside the relic-builder criteria state above.
         }
 
     # Passive names renamed between versions — profiles may contain old names.
@@ -4197,13 +4169,17 @@ class RelicBotApp(tk.Tk):
             # Restore the active mode into the UI
             self._restore_mode_data(_rtype)
             self._save_exclusion_matches_var.set(data.get("save_exclusion_matches", False))
+            # Profiles written before per-target colours carry a single
+            # run-wide "allowed_colors" list.  Seed every target/pairing/pool
+            # that has no colours of its own from it, so a user who had
+            # narrowed the old filter keeps that filter instead of silently
+            # widening to all four.  Must run AFTER _restore_mode_data above,
+            # which is what loads the builder state being seeded.
             if "allowed_colors" in data:
-                saved = data["allowed_colors"]
-                for color, var in self._color_vars.items():
-                    var.set(color in saved)
-            # gem images follow relic_type — sync after relic_type is loaded
-            self._gem_mode_var.set("don" if _rtype == "night" else "normal")
-            self._refresh_gem_images()
+                try:
+                    self.relic_builder.migrate_legacy_colors(data["allowed_colors"])
+                except Exception:
+                    pass
         finally:
             self._loading_profile = False
 
@@ -4518,9 +4494,9 @@ class RelicBotApp(tk.Tk):
             # Reset relic type
             self.relic_type_var.set("night")
             self._on_relic_type_change()
-            # Reset colors to all enabled
-            for var in self._color_vars.values():
-                var.set(True)
+            # Colours reset with the criteria themselves — _restore_mode_data
+            # below rebuilds the builder state, and a fresh target/pool
+            # defaults to all four colours.
             self._save_exclusion_matches_var.set(False)
             # Clear UI
             self._restore_mode_data("night")
@@ -5968,7 +5944,8 @@ class RelicBotApp(tk.Tk):
                     "increase iterations to let branches form.")
         criteria = self.relic_builder.get_criteria_dict()
         criteria_summary = self.relic_builder.get_criteria_summary()
-        criteria["allowed_colors"] = self._get_allowed_colors()
+        # Colours ride inside the criteria (per target / pairing / pool) and
+        # are baked into the doors below — there is no run-wide colour key.
         # Pre-compute matching doors from criteria for fast relic comparison.
         from bot.door_generator import (
             generate_doors, generate_smart_doors,
@@ -12880,27 +12857,6 @@ class RelicBotApp(tk.Tk):
     def _get_region(self):
         return None
 
-    def _on_color_change(self):
-        enabled = {c for c, v in self._color_vars.items() if v.get()}
-        if not enabled:
-            # Keep only the last enabled color — don't re-enable the others
-            for c in self._prev_colors:
-                self._color_vars[c].set(True)
-            # Cancel any pending dismiss job and start a fresh one
-            if self._color_warn_job:
-                self.after_cancel(self._color_warn_job)
-            self._color_warn.configure(text="At least one color must be enabled.")
-            self._color_warn_job = self.after(
-                5000, lambda: self._color_warn.configure(text=""))
-        else:
-            self._prev_colors = enabled
-            self._color_warn.configure(text="")
-            if self._color_warn_job:
-                self.after_cancel(self._color_warn_job)
-                self._color_warn_job = None
-        self.relic_builder.set_relic_context(
-            self.relic_type_var.get(), self._get_allowed_colors())
-
     def _slider_key_press(self, delta: int):
         """Move the Odds Viewer slider by delta on arrow key press, with hold-repeat."""
         v = int(round(self._ov_slider.get()))
@@ -13236,24 +13192,6 @@ class RelicBotApp(tk.Tk):
         # Resize height to fit content
         line_count = int(_ss.index("end-1c").split(".")[0])
         _ss.configure(height=max(3, line_count), state="disabled")
-
-    def _toggle_color(self, color: str):
-        """Toggle a relic colour checkbox when its gem image is clicked."""
-        var = self._color_vars.get(color)
-        if var:
-            var.set(not var.get())
-            self._on_color_change()
-
-    def _refresh_gem_images(self):
-        """Update all gem image labels to match the current gem mode."""
-        don = self._gem_mode_var.get() == "don"
-        for color, lbl in self._gem_img_labels.items():
-            photo = relic_images.get_gem(color, don=don)
-            lbl.configure(image=photo)
-            lbl.image = photo   # keep reference
-
-    def _get_allowed_colors(self) -> list[str]:
-        return [c for c, v in self._color_vars.items() if v.get()]
 
     @staticmethod
     def _detect_hardware() -> tuple[int, int, str]:
@@ -15580,3 +15518,33 @@ class RelicBotApp(tk.Tk):
                 nm_p = nm.get("matching_passives", [])
                 if nm_p:
                     self._log_relic(f"    Near miss: {', '.join(nm_p)}")
+
+            # ── Wrong-colour reporting ──────────────────────────────────── #
+            # The relic satisfied a door's passives but not that door's
+            # colours.  It stays a DUD — no folder, no screenshot kept — and
+            # is only counted and logged, so a colour selection that is
+            # quietly costing real relics is visible rather than an
+            # invisible non-match.
+            #
+            # LOAD-BEARING: this lives in `_log_result` because that is the
+            # ONE funnel every analyze path reaches — Standard mode analyses
+            # inline in `_run_iteration_phases` and never calls
+            # `_analyze_relic_task`, so reporting there would have covered
+            # async/backlog/hybrid and silently skipped Standard.
+            blocked = result.get("color_blocked") or []
+            if blocked:
+                try:
+                    color = result.get("relic_color") or "?"
+                    # Report the widest blocked door — the best this relic
+                    # would have scored had its colour been accepted.
+                    best    = max(blocked, key=lambda b: len(b.get("passives", [])))
+                    allowed = best.get("colors", [])
+                    hit_p   = best.get("passives", [])
+                    self._log_relic(
+                        f"    Wrong colour: matched {', '.join(hit_p)} "
+                        f"but relic is {color} — that target accepts "
+                        f"{', '.join(allowed)}")
+                    if self._diag is not None:
+                        self._diag.log_color_reject(name, color, allowed, hit_p)
+                except Exception:
+                    pass

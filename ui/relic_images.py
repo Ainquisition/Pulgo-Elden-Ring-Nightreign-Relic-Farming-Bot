@@ -9,7 +9,7 @@ still drawn procedurally since there is no in-game equivalent.
 import os
 import sys
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageEnhance
 from PIL import ImageTk   # bundled with Pillow
 
 
@@ -39,13 +39,28 @@ _COLOR_NAME: dict[str, str] = {
 }
 
 
-def _load_gem(color: str, don: bool) -> Image.Image:
-    """Load, resize, and return the PNG for the given colour/variant."""
+def _load_gem(color: str, don: bool, size: int = _GEM_SIZE,
+              dim: bool = False) -> Image.Image:
+    """Load, resize, and return the PNG for the given colour/variant.
+
+    `dim` renders the deselected state of a colour toggle: the SAME artwork
+    desaturated and darkened, never a different icon.  Deriving it here keeps
+    one source of truth for the gems — an "off" gem that was its own PNG would
+    drift from the real one the first time the art is updated.
+    """
     prefix  = "deep" if don else "normal"
     name    = _COLOR_NAME.get(color, color.lower())
     path    = os.path.join(_icons_dir(), f"{prefix}_{name}.png")
     img     = Image.open(path).convert("RGBA")
-    return img.resize((_GEM_SIZE, _GEM_SIZE), Image.LANCZOS)
+    img     = img.resize((size, size), Image.LANCZOS)
+    if dim:
+        alpha = img.getchannel("A")
+        rgb   = img.convert("RGB")
+        rgb   = ImageEnhance.Color(rgb).enhance(0.15)      # nearly greyscale
+        rgb   = ImageEnhance.Brightness(rgb).enhance(0.45)  # and darkened
+        img   = rgb.convert("RGBA")
+        img.putalpha(alpha.point(lambda a: int(a * 0.65)))
+    return img
 
 
 # ── Blank gem (procedural) ───────────────────────────────────────────────── #
@@ -96,17 +111,25 @@ def _make_blank_gem(size: int = _BLANK_GEM_SIZE) -> Image.Image:
 
 # ── Public API ───────────────────────────────────────────────────────────── #
 
-def get_gem(color: str, don: bool = False) -> ImageTk.PhotoImage:
+def get_gem(color: str, don: bool = False, size: int = _GEM_SIZE,
+            dim: bool = False) -> ImageTk.PhotoImage:
     """
     Return a cached PhotoImage for the given relic colour.
 
     Args:
         color:  One of "Red", "Blue", "Green", "Yellow".
         don:    If True, return the Deep of Night variant.
+        size:   Pixel size (square).  Colour toggles inside the relic builder
+                use a smaller gem than the main tab's 64 px.
+        dim:    If True, return the deselected/greyed rendering.
+
+    LOAD-BEARING: `size` and `dim` are part of the cache key.  They were added
+    after the key was already `color_variant`; omitting them would serve a
+    64 px lit gem for every request and every toggle would look enabled.
     """
-    key = f"{color}_{'don' if don else 'normal'}"
+    key = f"{color}_{'don' if don else 'normal'}_{size}_{'dim' if dim else 'lit'}"
     if key not in _cache:
-        _cache[key] = ImageTk.PhotoImage(_load_gem(color, don))
+        _cache[key] = ImageTk.PhotoImage(_load_gem(color, don, size, dim))
     return _cache[key]
 
 

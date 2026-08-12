@@ -10,19 +10,37 @@ Provides two modes selectable via a notebook (tab bar):
                     at least N of them simultaneously.
 """
 
+import math
 import re
 import tkinter as tk
 from tkinter import ttk
 
 
 def _fmt_pct(pct: float) -> str:
-    """Format a percentage value (already ×100) with adaptive decimal places.
-    Shows at least 2 decimal places; extends until the first non-zero digit
-    appears, so very small odds like 0.0003% are not rounded away to 0.00%."""
-    decimals = 2
-    while decimals < 12 and round(pct, decimals) == 0.0:
-        decimals += 1
-    return f"{pct:.{decimals}f}"
+    """Format a percentage value (already ×100) to ~3 significant digits.
+
+    Always at least 2 decimal places, so everyday values render exactly as
+    before ("25.00", "1.17", "0.29").
+
+    The old version extended decimals only until `round()` first produced a
+    non-zero, which yields ONE significant digit on small odds — and rounding
+    can trip a place early: 0.0060511 rendered as "0.01" while 0.0015128
+    rendered as "0.002".  Those read as a 5x difference for values that are
+    exactly 4x apart, which matters now that a colour filter scales odds by
+    a known factor.  Scaling the decimal count off the magnitude keeps the
+    significant digits instead of the decimal places fixed.
+    """
+    if not pct or pct <= 0 or pct != pct:      # zero, negative, or NaN
+        return "0.00"
+    exp = math.floor(math.log10(pct))
+    decimals = min(12, max(2, 2 - exp))
+    s = f"{pct:.{decimals}f}"
+    if decimals > 2 and "." in s:
+        # Trim padding zeros the extra precision added, but never show fewer
+        # than 2 decimals ("0.290" -> "0.29", "0.00200" -> "0.002").
+        head, _, frac = s.rstrip("0").partition(".")
+        s = f"{head}.{frac.ljust(2, '0')}"
+    return s
 
 from ui import theme, relic_images
 from bot.passives import (
@@ -32,9 +50,31 @@ from bot.passives import (
 from bot.probability_engine import (
     prob_combo_on_relic, prob_any_combo_on_relic,
     prob_passive_on_relic, prob_at_least_k_of_pool,
-    compat_ok,
+    compat_ok, color_probability,
     DEEP_POOL_PASSIVES, NORMAL_POOL_PASSIVES,
 )
+from bot.door_generator import norm_colors
+
+
+def _color_odds_line(colors, relic_type: str, indent: str = "  ") -> str | None:
+    """One breakdown line stating what a colour selection costs.
+
+    Returns None when all four colours are selected: an unrestricted filter
+    contributes a factor of 1.0 and listing it would be noise in a breakdown
+    that is meant to show what each choice costs.
+
+    The odds printed above and below this line ALREADY include the factor —
+    the line exists so the user can see how much of their rarity comes from
+    the colour choice rather than from the passives.
+    """
+    picked = [c for c in (colors or []) if c in RELIC_COLORS]
+    if not picked or len(picked) == len(RELIC_COLORS):
+        return None
+    p = color_probability(relic_type, picked)
+    if p <= 0:
+        return None
+    return (f"{indent}Colour ({', '.join(picked)})  →  {_fmt_pct(p * 100)}% "
+            f"of relics  (×{p:.2f} on the odds shown)")
 
 
 def _passive_variants(passive: str, pool: "frozenset[str] | None" = None) -> list[str]:
@@ -73,6 +113,101 @@ def _entry_label(entry: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────── #
 #  LOW-LEVEL REUSABLE WIDGET
 # ─────────────────────────────────────────────────────────────────────────── #
+
+RELIC_COLORS: tuple[str, ...] = ("Red", "Blue", "Green", "Yellow")
+
+
+class _ColorSelect(ttk.Frame):
+    """Click-toggle relic-colour gems, with a hard one-colour minimum.
+
+    Used in three places — per exact target, per pairing, and for the passive
+    pool.  Each instance owns an independent selection; they are never merged.
+
+    LOAD-BEARING: this is the ONLY implementation of the minimum-one rule.
+    Every caller goes through `get()`/`set_colors()`, so the rule cannot drift
+    between the three surfaces the way a copy-pasted handler would.  A relic
+    always has a colour, so "no colours" is not a state the UI may produce.
+    """
+
+    _GEM_PX = 44
+
+    def __init__(self, parent, on_change=None, don: bool = False,
+                 gem_px: int | None = None, caption: str | None = None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._on_change = on_change
+        self._don       = bool(don)
+        self._gem_px    = gem_px or self._GEM_PX
+        self._selected: set[str] = set(RELIC_COLORS)
+        self._labels: dict[str, ttk.Label] = {}
+        self._warn_job = None
+        self._build(caption)
+
+    def _build(self, caption: str | None):
+        if caption:
+            ttk.Label(self, text=caption, foreground=theme.TEXT_MUTED,
+                      wraplength=380, justify="left").pack(anchor="w")
+        row = ttk.Frame(self)
+        row.pack(anchor="w", pady=(2, 0))
+        for color in RELIC_COLORS:
+            lbl = ttk.Label(row, cursor="hand2")
+            lbl.pack(side="left", padx=3)
+            lbl.bind("<Button-1>", lambda _e, c=color: self._toggle(c))
+            self._labels[color] = lbl
+        self._warn = ttk.Label(self, text="", foreground="#ff6666")
+        self._warn.pack(anchor="w")
+        self._refresh()
+
+    # ── state ─────────────────────────────────────────────────────────── #
+
+    def _toggle(self, color: str):
+        if color in self._selected:
+            if len(self._selected) == 1:
+                self._flash("At least one colour must stay selected.")
+                return
+            self._selected.discard(color)
+        else:
+            self._selected.add(color)
+        self._refresh()
+        if self._on_change:
+            self._on_change()
+
+    def _flash(self, msg: str):
+        self._warn.configure(text=msg)
+        if self._warn_job:
+            try:
+                self.after_cancel(self._warn_job)
+            except Exception:
+                pass
+        self._warn_job = self.after(4000, lambda: self._warn.configure(text=""))
+
+    def _refresh(self):
+        for color, lbl in self._labels.items():
+            lbl.configure(image=relic_images.get_gem(
+                color, don=self._don, size=self._gem_px,
+                dim=color not in self._selected))
+
+    # ── public API ────────────────────────────────────────────────────── #
+
+    def get(self) -> list[str]:
+        """Selected colours, in canonical order (never empty)."""
+        return [c for c in RELIC_COLORS if c in self._selected]
+
+    def set_colors(self, colors) -> None:
+        """Set the selection.  Empty/unknown input falls back to all four —
+        a target loaded from a pre-colour profile is unrestricted, not dead."""
+        picked = {c for c in (colors or []) if c in RELIC_COLORS}
+        self._selected = picked or set(RELIC_COLORS)
+        self._refresh()
+
+    def set_don(self, don: bool) -> None:
+        """Swap between Normal and Deep of Night gem art."""
+        if bool(don) != self._don:
+            self._don = bool(don)
+            self._refresh()
+
+    def is_all(self) -> bool:
+        return len(self._selected) == len(RELIC_COLORS)
+
 
 class _SearchableListbox(ttk.Frame):
     """Search entry + scrollable listbox combo."""
@@ -253,7 +388,6 @@ class _ExactRelicTab(ttk.Frame):
         self._threshold_var = tk.IntVar(value=2)
         self._compat_var = tk.StringVar(value="")
         self._relic_type: str = "night"
-        self._allowed_colors: list[str] = ["Red", "Blue", "Green", "Yellow"]
         self._build()
 
     # ── construction ─────────────────────────────────────────────────── #
@@ -280,7 +414,8 @@ class _ExactRelicTab(ttk.Frame):
 
     @staticmethod
     def _new_target() -> dict:
-        return {"slots": [None, None, None], "threshold": 2}
+        return {"slots": [None, None, None], "threshold": 2,
+                "colors": list(RELIC_COLORS)}
 
     def _build(self):
         header = ttk.Frame(self)
@@ -345,6 +480,19 @@ class _ExactRelicTab(ttk.Frame):
         self._threshold_spin.pack(side="left", padx=4)
         ttk.Label(foot, text="of the specified passives are present.").pack(side="left")
 
+        # ── Per-target colour filter ───────────────────────────────────── #
+        # Belongs to THIS target only.  It is not the pool tab's selection and
+        # is not a run-wide setting; each target in the list carries its own.
+        color_frame = ttk.LabelFrame(right, text="Relic Colours for this Target")
+        color_frame.pack(fill="x", padx=6, pady=(2, 4))
+        self._color_select = _ColorSelect(
+            color_frame, on_change=self._on_color_change,
+            caption=("Click a gem to include or exclude that colour for this "
+                     "target. This target only matches relics of a selected "
+                     "colour — other targets keep their own colours."),
+        )
+        self._color_select.pack(anchor="w", padx=6, pady=(4, 6))
+
         self._compat_lbl = ttk.Label(
             foot, textvariable=self._compat_var,
             foreground="#ff6666", wraplength=440,
@@ -395,6 +543,12 @@ class _ExactRelicTab(ttk.Frame):
         for i, t in enumerate(self._targets):
             filled = [s for s in t["slots"] if s]
             summary = " / ".join(s[:20] for s in filled) if filled else "(empty)"
+            # Show a colour marker when the target is restricted, so a
+            # colour-limited target is visible in the list without selecting
+            # it.  All four colours = unrestricted = no marker (no noise).
+            colors = t.get("colors") or list(RELIC_COLORS)
+            if len(colors) < len(RELIC_COLORS):
+                summary += f"  [{'/'.join(c[0] for c in colors)}]"
             self._target_lb.insert("end", f" #{i + 1}: {summary}")
 
     def _on_target_select(self, _event=None):
@@ -423,12 +577,14 @@ class _ExactRelicTab(ttk.Frame):
         t = self._targets[self._active]
         t["slots"] = [s.get() for s in self._slots]
         t["threshold"] = self._threshold_var.get()
+        t["colors"] = self._color_select.get()
 
     def _load_active(self):
         t = self._targets[self._active]
         for s, val in zip(self._slots, t["slots"]):
             s.set_value(val)
         self._threshold_var.set(t["threshold"])
+        self._color_select.set_colors(t.get("colors"))
         self._update_exclusions()
         self._check_compat()
         self._update_odds()
@@ -488,20 +644,30 @@ class _ExactRelicTab(ttk.Frame):
         self._refresh_list()
         self._target_lb.selection_set(self._active)
 
-    def set_relic_context(self, relic_type: str, allowed_colors: list[str]) -> None:
-        """Called by RelicBuilderFrame when relic type or color selection changes."""
+    def set_relic_context(self, relic_type: str) -> None:
+        """Called by RelicBuilderFrame when the relic type changes.
+
+        Colours are no longer passed in — each target owns its own selection.
+        """
         self._relic_type = relic_type
-        self._allowed_colors = list(allowed_colors)
         pool_label = "Deep of Night" if relic_type == "night" else "Normal"
-        color_note = (f"{len(allowed_colors)} color(s) selected"
-                      if len(allowed_colors) < 4 else "all colors")
         self._odds_disclaimer_var.set(
-            f"Odds from AttachEffectTableParam ({pool_label} pools, {color_note}). "
-            f"Per-relic rate accounts for size distribution and color filter.")
+            f"Odds from AttachEffectTableParam ({pool_label} pools). "
+            f"Per-relic rate accounts for size distribution and the colours "
+            f"selected for each target.")
+        # Gems follow the relic type so the art matches what is being farmed.
+        self._color_select.set_don(relic_type == "night")
         # Update slot listboxes to show only passives available in the current mode
         for slot in self._slots:
             slot.set_mode_passives(relic_type)
         self._update_odds()
+
+    def _on_color_change(self):
+        self._save_current()
+        self._update_odds()
+        self._refresh_list()
+        self._target_lb.selection_clear(0, "end")
+        self._target_lb.selection_set(self._active)
 
     def _on_threshold_change(self):
         self._save_current()
@@ -571,7 +737,8 @@ class _ExactRelicTab(ttk.Frame):
     def _update_odds(self):
         """Recompute and display odds for the currently active target."""
         rtype  = self._relic_type
-        colors = self._allowed_colors
+        # Odds reflect THIS target's colours, not a run-wide filter.
+        colors = self._color_select.get()
 
         slots  = [s.get() for s in self._slots]
         filled = [(i, p) for i, p in enumerate(slots) if p]
@@ -604,6 +771,12 @@ class _ExactRelicTab(ttk.Frame):
             else:
                 lines.append(f"  {p}  →  not in {pool_name} pool")
 
+        # What this target's colour selection contributes.  Only rendered
+        # when the selection is actually restricted.
+        _cl = _color_odds_line(colors, rtype)
+        if _cl:
+            lines.append(_cl)
+
         # ── Access enhanced engine via parent ─────────────────────────────────
         try:
             nb = self.nametowidget(self.winfo_parent())
@@ -621,7 +794,8 @@ class _ExactRelicTab(ttk.Frame):
         from bot.door_generator import _doors_from_exact
         _target_pool = DEEP_POOL_PASSIVES if rtype == "night" else NORMAL_POOL_PASSIVES
         _this_target_doors = _doors_from_exact(
-            {"targets": [{"passives": targets, "threshold": thresh}]},
+            {"targets": [{"passives": targets, "threshold": thresh,
+                          "colors": colors}]},
             _target_pool)
 
         if _compute and _this_target_doors:
@@ -634,10 +808,14 @@ class _ExactRelicTab(ttk.Frame):
                 per_p = [prob_passive_on_relic(t, rtype, colors) or 0.0 for t in targets]
                 p_this = prob_at_least_k_of_pool(per_p, thresh)
 
+        _this_idx: int | None = None
+        _this_label = ""
         if p_this and p_this > 0:
             n = int(round(1.0 / p_this))
             pct = p_this * 100
             label = f"all {n_filled}" if thresh >= n_filled else f"\u2265{thresh} of {n_filled}"
+            _this_label = label
+            _this_idx = len(lines)
             lines.append(f"  This target ({label}): {_fmt_pct(pct)}%  (~1 in {n:,} per relic)")
         elif p_this == 0.0:
             lines.append(f"  Impossible Combo \u2014 can't be rolled on {pool_name} Relics")
@@ -647,16 +825,22 @@ class _ExactRelicTab(ttk.Frame):
         # ── All defined targets combined (any target matches) ────────────────
         self._save_current()
         all_valid = [
-            {"slots": [p for p in t["slots"] if p], "threshold": t["threshold"]}
+            {"slots": [p for p in t["slots"] if p], "threshold": t["threshold"],
+             "colors": t.get("colors") or list(RELIC_COLORS)}
             for t in self._targets
             if any(t["slots"])
         ]
         p_combined: float | None = None
 
-        if len(all_valid) > 1:
+        # Computed for ANY number of targets, not just 2+.  With a single
+        # target this equals "This target", but the user asked for a total
+        # that is always on screen rather than one that appears only once a
+        # second target exists.
+        if all_valid:
             # Generate doors for ALL targets and compute combined probability
             all_target_doors = _doors_from_exact(
-                {"targets": [{"passives": t["slots"], "threshold": t["threshold"]}
+                {"targets": [{"passives": t["slots"], "threshold": t["threshold"],
+                              "colors": t["colors"]}
                              for t in all_valid]},
                 _target_pool)
             if _compute and all_target_doors:
@@ -665,10 +849,14 @@ class _ExactRelicTab(ttk.Frame):
             else:
                 complement = 1.0
                 for t in all_valid:
+                    # Each target contributes at ITS OWN colours — using the
+                    # active target's colours here would misprice every other
+                    # target in the combined line.
+                    t_colors = t["colors"]
                     if t["threshold"] >= len(t["slots"]):
-                        p = prob_combo_on_relic(t["slots"], rtype, colors)
+                        p = prob_combo_on_relic(t["slots"], rtype, t_colors)
                     else:
-                        pp_list = [prob_passive_on_relic(s, rtype, colors) or 0.0
+                        pp_list = [prob_passive_on_relic(s, rtype, t_colors) or 0.0
                                    for s in t["slots"]]
                         p = prob_at_least_k_of_pool(pp_list, t["threshold"])
                     if p and p > 0:
@@ -678,7 +866,31 @@ class _ExactRelicTab(ttk.Frame):
             if p_combined and p_combined > 0:
                 n_any = int(round(1.0 / max(p_combined, 1e-12)))
                 pct_any = p_combined * 100
-                lines.append(f"  Odds of meeting any of {len(all_valid)} targets: {_fmt_pct(pct_any)}%  (~1 in {n_any:,} per relic)")
+                if len(all_valid) == 1:
+                    # One target: "This target" and the TOTAL are the same
+                    # number.  Drop the separate line and fold its threshold
+                    # label into the TOTAL rather than printing both.
+                    _tgt_word = f"this target ({_this_label})" if _this_label else "this target"
+                    if _this_idx is not None:
+                        del lines[_this_idx]
+                else:
+                    _tgt_word = f"any of {len(all_valid)} targets"
+                # Only pad when the previous line isn't already blank —
+                # deleting the "This target" line above can leave one behind.
+                if lines and lines[-1] != "":
+                    lines.append("")
+                lines.append(
+                    f"  TOTAL — odds of finding a relic matching {_tgt_word}:"
+                    f"  {_fmt_pct(pct_any)}%  (~1 in {n_any:,} per relic)")
+                # Every target's own colours are already baked into the doors
+                # above; say so, because a user who restricted colours should
+                # be able to tell that the total reflects it.
+                _restricted = [t for t in all_valid
+                               if len(t["colors"]) < len(RELIC_COLORS)]
+                if _restricted:
+                    lines.append(
+                        f"  (includes the colour filter on "
+                        f"{len(_restricted)} of {len(all_valid)} target(s))")
 
         self._propagate_p(p_combined if p_combined is not None else p_this)
         self._set_odds_text("\n".join(lines))
@@ -726,6 +938,9 @@ class _ExactRelicTab(ttk.Frame):
                 f"The relic is a MATCH if it has at least {thresh} of the specified passives.",
                 "Slots marked '(any)' can contain any passive.",
             ]
+            _tc = t.get("colors") or list(RELIC_COLORS)
+            if len(_tc) < len(RELIC_COLORS):
+                lines.append(f"The relic must also be one of these colours: {', '.join(_tc)}.")
             return "\n".join(lines)
 
         lines = [
@@ -741,6 +956,9 @@ class _ExactRelicTab(ttk.Frame):
             )
             for i, v in enumerate(t["slots"]):
                 lines.append(f"  Slot {i + 1}: {v if v else '(any)'}")
+            _tc = t.get("colors") or list(RELIC_COLORS)
+            if len(_tc) < len(RELIC_COLORS):
+                lines.append(f"  Colours: {', '.join(_tc)}")
             lines.append("")
         return "\n".join(lines)
 
@@ -751,10 +969,26 @@ class _ExactRelicTab(ttk.Frame):
         return {
             "mode": "exact",
             "targets": [
-                {"passives": [s for s in t["slots"] if s], "threshold": t["threshold"]}
+                {"passives": [s for s in t["slots"] if s],
+                 "threshold": t["threshold"],
+                 "colors": t.get("colors") or list(RELIC_COLORS)}
                 for t in valid
             ],
         }
+
+    def apply_legacy_colors(self, colors: list[str]) -> None:
+        """Seed targets that are still unrestricted from the old global filter.
+
+        Only all-four (unrestricted) targets are touched, so re-running this
+        can never narrow a selection the user made deliberately.
+        """
+        for t in self._targets:
+            if len(t.get("colors") or RELIC_COLORS) == len(RELIC_COLORS):
+                t["colors"] = list(colors)
+        self._color_select.set_colors(
+            self._targets[self._active].get("colors"))
+        self._refresh_list()
+        self._update_odds()
 
     def is_valid(self) -> bool:
         self._save_current()
@@ -778,14 +1012,21 @@ class _ExactRelicTab(ttk.Frame):
     def get_state(self) -> dict:
         self._save_current()
         return {
-            "targets": [{"slots": list(t["slots"]), "threshold": t["threshold"]} for t in self._targets],
+            "targets": [{"slots": list(t["slots"]), "threshold": t["threshold"],
+                         "colors": list(t.get("colors") or RELIC_COLORS)}
+                        for t in self._targets],
             "active": self._active,
         }
 
     def set_state(self, state: dict):
         targets = state.get("targets", [])
+        # A profile saved before per-target colours has no "colors" key.
+        # Default to all four (unrestricted) so an old profile behaves
+        # exactly as it did — never to empty, which would match nothing.
         self._targets = [
-            {"slots": list(t.get("slots", [None, None, None])), "threshold": t.get("threshold", 2)}
+            {"slots": list(t.get("slots", [None, None, None])),
+             "threshold": t.get("threshold", 2),
+             "colors": list(t.get("colors") or RELIC_COLORS)}
             for t in targets
         ] or [self._new_target()]
         self._active = min(state.get("active", 0), len(self._targets) - 1)
@@ -868,6 +1109,9 @@ class _CreatePairingDialog(tk.Toplevel):
         self._right: list[str] = list((initial or {}).get("right", []))
         self._pool:  list[str] = list((initial or {}).get("pool", []))
         self._relic_type = relic_type
+        # A pairing saved before this feature has no colours — unrestricted.
+        self._initial_colors: list[str] = list(
+            (initial or {}).get("colors") or RELIC_COLORS)
 
         ttk.Label(
             self,
@@ -965,6 +1209,18 @@ class _CreatePairingDialog(tk.Toplevel):
         )
         # Hidden until there are conflicts
         self._pool_hint_visible = False
+
+        # ── Colours for this pairing ──────────────────────────────────── #
+        # Independent of the pool tab's colours and of every exact target.
+        color_frame = ttk.LabelFrame(self, text="Relic Colours for this Pairing")
+        color_frame.pack(fill="x", padx=12, pady=(6, 2))
+        self._color_select = _ColorSelect(
+            color_frame, don=(relic_type == "night"),
+            caption=("Click a gem to include or exclude that colour. This "
+                     "pairing only matches relics of a selected colour."),
+        )
+        self._color_select.pack(anchor="w", padx=6, pady=(4, 6))
+        self._color_select.set_colors(self._initial_colors)
 
         # ── Confirm row ───────────────────────────────────────────────── #
         btn_row = ttk.Frame(self)
@@ -1144,6 +1400,7 @@ class _CreatePairingDialog(tk.Toplevel):
             "left": self._left,
             "right": self._right,
             "pool": list(self._pool),
+            "colors": self._color_select.get(),
         }
         self.destroy()
 
@@ -1165,10 +1422,9 @@ class _PassivePoolTab(ttk.Frame):
         super().__init__(parent, **kwargs)
         # Pool entries: {"accepted": list[str]}  (no pair_required — pairings are separate)
         self._entries: list[dict] = []
-        # Pairings: {"left": list[str], "right": list[str]}  (independent of pool)
+        # Pairings: {"left", "right", "pool", "colors"}  (independent of pool)
         self._pairings: list[dict] = []
         self._relic_type: str = "night"
-        self._allowed_colors: list[str] = ["Red", "Blue", "Green", "Yellow"]
         self._build()
 
     def _set_odds_text(self, text: str) -> None:
@@ -1299,6 +1555,20 @@ class _PassivePoolTab(ttk.Frame):
         ttk.Label(pair_foot, textvariable=self._pair_count_lbl,
                   foreground=theme.TEXT_MUTED).pack(side="left")
 
+        # ── Pool colour filter ────────────────────────────────────────────── #
+        # This is the pool's OWN colour selection — it governs which relics My
+        # Pool draws from.  It does not apply to exact targets, and pairings
+        # carry their own colours chosen in the pairing dialog.
+        color_frame = ttk.LabelFrame(self, text="Relic Colours for this Pool")
+        color_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self._color_select = _ColorSelect(
+            color_frame, on_change=self._on_pool_color_change,
+            caption=("Click a gem to include or exclude that colour. My Pool "
+                     "only matches relics of a selected colour. Pairings have "
+                     "their own colours; exact targets are unaffected."),
+        )
+        self._color_select.pack(anchor="w", padx=6, pady=(4, 6))
+
         # ── Odds display (aligned to the All Passives column) ────────────── #
         odds_frame = ttk.LabelFrame(content, text="Odds  (per relic)")
         odds_frame.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(4, 6))
@@ -1346,10 +1616,12 @@ class _PassivePoolTab(ttk.Frame):
         self._left_lb.set_items(items)
         self._left_lb.clear_search()
 
-    def set_relic_context(self, relic_type: str, allowed_colors: list[str]) -> None:
-        """Called by RelicBuilderFrame when relic type or color selection changes."""
+    def set_relic_context(self, relic_type: str) -> None:
+        """Called by RelicBuilderFrame when the relic type changes.
+
+        Colours are owned by this tab (and by each pairing), not passed in.
+        """
         self._relic_type = relic_type
-        self._allowed_colors = list(allowed_colors)
         # Rebuild per-mode categories
         pool = DEEP_POOL_PASSIVES if relic_type == "night" else NORMAL_POOL_PASSIVES
         self._mode_cats = build_mode_categories(pool)
@@ -1357,13 +1629,30 @@ class _PassivePoolTab(ttk.Frame):
         self._cat_var.set("(all)")
         self._cat_cb.configure(values=cats)
         pool_label = "Deep of Night" if relic_type == "night" else "Normal"
-        color_note = (f"{len(allowed_colors)} color(s) selected"
-                      if len(allowed_colors) < 4 else "all colors")
         self._odds_disclaimer_var.set(
-            f"Odds from AttachEffectTableParam ({pool_label} pools, {color_note}). "
-            f"Per-relic rate accounts for size distribution and color filter.")
+            f"Odds from AttachEffectTableParam ({pool_label} pools). "
+            f"Per-relic rate accounts for size distribution and the colours "
+            f"selected for the pool and for each pairing.")
+        self._color_select.set_don(relic_type == "night")
         # Refresh listbox to show only passives available in the current mode
         self._on_cat_change()
+        self._update_odds()
+
+    def _on_pool_color_change(self):
+        self._update_odds()
+
+    def get_colors(self) -> list[str]:
+        return self._color_select.get()
+
+    def apply_legacy_colors(self, colors: list[str]) -> None:
+        """Seed the pool and any still-unrestricted pairing from the old
+        global filter.  Deliberate narrower selections are left alone."""
+        if self._color_select.is_all():
+            self._color_select.set_colors(colors)
+        for p in self._pairings:
+            if len(p.get("colors") or RELIC_COLORS) == len(RELIC_COLORS):
+                p["colors"] = list(colors)
+        self._refresh_pairings()
         self._update_odds()
 
     def _on_threshold_change(self):
@@ -1400,7 +1689,9 @@ class _PassivePoolTab(ttk.Frame):
             accepted = entry["accepted"]
             label = _entry_label(entry)
             # Generate doors for this single entry (each accepted variant = 1-passive door)
-            entry_doors = [(frozenset([p]), "entry") for p in accepted
+            _pool_colors = self._color_select.get()
+            entry_doors = [(frozenset([p]), "entry", norm_colors(_pool_colors))
+                           for p in accepted
                            if p in (DEEP_POOL_PASSIVES if rtype == "night" else NORMAL_POOL_PASSIVES)]
             if _compute and entry_doors:
                 p_m, p_c = _compute(entry_doors)
@@ -1416,6 +1707,13 @@ class _PassivePoolTab(ttk.Frame):
                 lines.append(f"    {label}  \u2192  Impossible Combo \u2014 passives are from the same exclusive group")
             else:
                 lines.append(f"    {label}  \u2192  not in {pool_name} pool")
+
+        # What the pool's own colour selection contributes to every entry
+        # above.  Pairings are listed separately below with their own.
+        if self._entries:
+            _pcl = _color_odds_line(self._color_select.get(), rtype, indent="    ")
+            if _pcl:
+                lines.append(_pcl)
 
         # ── Pairing odds ─────────────────────────────────────────────────────
         if self._pairings:
@@ -1453,10 +1751,13 @@ class _PassivePoolTab(ttk.Frame):
                 p_m, p_c = _compute(pair_doors)
                 pair_p = p_c if p_c > 1e-15 else p_m
             else:
-                # Fallback to old engine
+                # Fallback to old engine.  Index the door rather than
+                # unpacking — doors carry a colour element now.
                 pair_p = 0.0
-                for d, _ in pair_doors:
-                    p = prob_combo_on_relic(list(d), rtype)
+                for _pd in pair_doors:
+                    d = _pd[0]
+                    p = prob_combo_on_relic(
+                        list(d), rtype, list(_pd[2]) if len(_pd) > 2 and _pd[2] else None)
                     if p and p > 0:
                         pair_p = 1.0 - (1.0 - pair_p) * (1.0 - p)
 
@@ -1465,6 +1766,10 @@ class _PassivePoolTab(ttk.Frame):
                 pct = pair_p * 100
                 lines.append(f"    {pair_label}  \u2192  {_fmt_pct(pct)}%  (~1 in {n:,} per relic)")
                 per_relic_probs.append(pair_p)
+                # This pairing's OWN colours \u2014 not the pool's.
+                _paircl = _color_odds_line(pair.get("colors"), rtype, indent="      ")
+                if _paircl:
+                    lines.append(_paircl)
             else:
                 lines.append(f"    {pair_label}  \u2192  not available in {pool_name} pool")
 
@@ -1480,10 +1785,14 @@ class _PassivePoolTab(ttk.Frame):
                 p_m, p_c = _compute(_all_doors)
                 p_combined = p_c if p_c > 1e-15 else p_m
             elif _all_doors:
-                # Fallback: complement product from per-entry probs
+                # Fallback: complement product from per-entry probs.  Index
+                # the door — it carries a colour element now — and price each
+                # one at its own colours.
                 comp = 1.0
-                for d, _ in _all_doors:
-                    p = prob_combo_on_relic(list(d), rtype)
+                for _d in _all_doors:
+                    p = prob_combo_on_relic(
+                        list(_d[0]), rtype,
+                        list(_d[2]) if len(_d) > 2 and _d[2] else None)
                     if p and p > 0:
                         comp *= (1.0 - p)
                 p_combined = 1.0 - comp if comp < 1.0 else None
@@ -1499,8 +1808,19 @@ class _PassivePoolTab(ttk.Frame):
             n_combined = int(round(1.0 / max(p_combined, 1e-12)))
             pct_combined = p_combined * 100
             lines.append(
-                f"\n  Odds of finding a matching relic (any criteria):"
+                f"\n  TOTAL — odds of finding a relic matching any criteria:"
                 f"  {_fmt_pct(pct_combined)}%  (~1 in {n_combined:,} per relic)")
+            _pool_restricted = len(self._color_select.get()) < len(RELIC_COLORS)
+            _pair_restricted = sum(
+                1 for _p in self._pairings
+                if len(_p.get("colors") or RELIC_COLORS) < len(RELIC_COLORS))
+            if _pool_restricted or _pair_restricted:
+                _bits = []
+                if _pool_restricted:
+                    _bits.append("the pool's colours")
+                if _pair_restricted:
+                    _bits.append(f"{_pair_restricted} pairing colour filter(s)")
+                lines.append(f"  (includes {' and '.join(_bits)})")
 
         self._propagate_p(p_combined)
         self._set_odds_text("\n".join(lines))
@@ -1589,6 +1909,10 @@ class _PassivePoolTab(ttk.Frame):
             if pool:
                 pool_tag = f"pool({len(pool)})"
                 label = f"{label}  +  {pool_tag}" if label else pool_tag
+            # Colour marker only when restricted — all four adds no signal.
+            _pc = p.get("colors") or list(RELIC_COLORS)
+            if len(_pc) < len(RELIC_COLORS):
+                label = f"{label}  [{'/'.join(c[0] for c in _pc)}]"
             self._pair_lb.insert("end", label or "(empty)")
 
     def _create_pairing(self):
@@ -1649,9 +1973,14 @@ class _PassivePoolTab(ttk.Frame):
             "mode": "pool",
             "entries":  [{"accepted": list(e["accepted"])} for e in self._entries],
             "pairings": [{"left": list(p["left"]), "right": list(p["right"]),
-                          "pool": list(p.get("pool", []))}
+                          "pool": list(p.get("pool", [])),
+                          # Each pairing's own colours, chosen in its dialog.
+                          "colors": list(p.get("colors") or RELIC_COLORS)}
                          for p in self._pairings],
             "threshold": self._threshold.get(),
+            # Colours for the pool entries only.  Pairings above override it
+            # with their own; exact targets never see this value.
+            "colors": self._color_select.get(),
         }
 
     def get_criteria_prompt(self) -> str:
@@ -1693,9 +2022,11 @@ class _PassivePoolTab(ttk.Frame):
         return {
             "entries":  [{"accepted": list(e["accepted"])} for e in self._entries],
             "pairings": [{"left": list(p["left"]), "right": list(p["right"]),
-                          "pool": list(p.get("pool", []))}
+                          "pool": list(p.get("pool", [])),
+                          "colors": list(p.get("colors") or RELIC_COLORS)}
                          for p in self._pairings],
             "threshold": self._threshold.get(),
+            "colors": self._color_select.get(),
         }
 
     def set_state(self, state: dict):
@@ -1718,9 +2049,13 @@ class _PassivePoolTab(ttk.Frame):
             # Valid if at least 2 of 3 slots are populated
             _filled = sum([bool(left), bool(right), bool(pool)])
             if _filled >= 2:
+                # Pairings saved before this feature have no colours —
+                # default to all four (unrestricted), never to empty.
                 self._pairings.append({"left": list(left), "right": list(right),
-                                       "pool": list(pool)})
+                                       "pool": list(pool),
+                                       "colors": list(p.get("colors") or RELIC_COLORS)})
         self._threshold.set(state.get("threshold", 2))
+        self._color_select.set_colors(state.get("colors"))
         self._sync_threshold()
         self._refresh_pairings()
 
@@ -2048,15 +2383,35 @@ class RelicBuilderFrame(ttk.LabelFrame):
         self._flatstone_lbl.configure(image=photo)
         self._flatstone_lbl.image = photo   # keep reference
 
-    def set_relic_context(self, relic_type: str, allowed_colors: list[str]) -> None:
+    def set_relic_context(self, relic_type: str) -> None:
         """
-        Propagate relic type and color selection to both builder tabs.
-        Call from app.py whenever relic type or color changes.
+        Propagate the relic type to both builder tabs.
+        Call from app.py whenever the relic type changes.
+
+        Colours are NOT propagated: the exact tab holds one selection per
+        target and the pool tab holds its own (plus one per pairing).  They
+        are deliberately independent — Combine mode runs both modes' doors
+        side by side rather than merging their colour selections.
         """
         self._relic_type = relic_type
-        self._exact.set_relic_context(relic_type, allowed_colors)
-        self._pool.set_relic_context(relic_type, allowed_colors)
+        self._exact.set_relic_context(relic_type)
+        self._pool.set_relic_context(relic_type)
         self._refresh_flatstone_icon()
+
+    def migrate_legacy_colors(self, colors: list[str]) -> None:
+        """Seed every target/pairing/pool that has no colours of its own from
+        the old run-wide filter.
+
+        Called once when a profile or config written before this feature is
+        loaded.  Without it, a user who had narrowed the old global filter to
+        (say) Red would silently start matching all four colours after the
+        update — the filter would look like it had been ignored.
+        """
+        picked = [c for c in (colors or []) if c in RELIC_COLORS]
+        if not picked or len(picked) == len(RELIC_COLORS):
+            return   # unrestricted before, unrestricted now — nothing to do
+        self._exact.apply_legacy_colors(picked)
+        self._pool.apply_legacy_colors(picked)
 
     def _set_p_per_relic(self, p: float | None) -> None:
         """Called by child tabs when they recompute per-relic probability.
@@ -2072,6 +2427,32 @@ class RelicBuilderFrame(ttk.LabelFrame):
         if self._on_odds_changed is not None:
             self._on_odds_changed(self._p_per_relic)
 
+    def _color_summary_line(self) -> str:
+        """Name the colour filters folded into the TOTAL above.
+
+        Returns "" when nothing is restricted so the caller can omit the line
+        entirely — an unrestricted run should read exactly as it did before
+        this feature existed.
+        """
+        bits: list[str] = []
+        n_exact = sum(
+            1 for t in self._exact._targets
+            if any(t["slots"])
+            and len(t.get("colors") or RELIC_COLORS) < len(RELIC_COLORS))
+        if n_exact:
+            bits.append(f"{n_exact} exact target(s)")
+        if (self._pool._entries
+                and len(self._pool.get_colors()) < len(RELIC_COLORS)):
+            bits.append("the passive pool")
+        n_pair = sum(
+            1 for p in self._pool._pairings
+            if len(p.get("colors") or RELIC_COLORS) < len(RELIC_COLORS))
+        if n_pair:
+            bits.append(f"{n_pair} pairing(s)")
+        if not bits:
+            return ""
+        return f"  (includes colour filters on {', '.join(bits)})"
+
     def _build_combined_odds_view(self):
         """Build unified odds text showing all groups with headers and subtotals.
 
@@ -2084,11 +2465,21 @@ class RelicBuilderFrame(ttk.LabelFrame):
         pool_name = "Deep of Night" if rtype == "night" else "Normal"
         lines: list[str] = []
         group_probs: list[float] = []  # per-group combined P for aggregate
+        # Indices of the "Odds from <group>" subtotal lines.  When only ONE
+        # group contributes, its subtotal is the same number as the TOTAL
+        # below it, so the subtotal is dropped rather than printing the same
+        # figure twice (reported by Pulgo on a pairings-only setup).
+        subtotal_idxs: list[int] = []
 
         # ── Build Exact Relic group ──────────────────────────────────────
         self._exact._save_current()
+        # LOAD-BEARING: carry each target's colours.  This view rebuilds its
+        # own doors instead of reusing get_criteria_dict(), so dropping the
+        # colours here made Combine-mode odds silently colour-blind while the
+        # single-tab views priced them correctly.
         exact_targets = [
-            {"slots": [p for p in t["slots"] if p], "threshold": t["threshold"]}
+            {"slots": [p for p in t["slots"] if p], "threshold": t["threshold"],
+             "colors": t.get("colors") or list(RELIC_COLORS)}
             for t in self._exact._targets
             if any(t["slots"])
         ]
@@ -2098,7 +2489,8 @@ class RelicBuilderFrame(ttk.LabelFrame):
             all_exact_doors = []
             for idx, t in enumerate(exact_targets):
                 t_doors = _doors_from_exact(
-                    {"targets": [{"passives": t["slots"], "threshold": t["threshold"]}]},
+                    {"targets": [{"passives": t["slots"], "threshold": t["threshold"],
+                                  "colors": t["colors"]}]},
                     pool)
                 all_exact_doors.extend(t_doors)
                 if t_doors:
@@ -2114,12 +2506,16 @@ class RelicBuilderFrame(ttk.LabelFrame):
                         f"  \u2192  {_fmt_pct(p_t*100)}%  (~1 in {int(round(1/p_t)):,})")
                 else:
                     lines.append(f"    Target {idx+1} ({label}): {slot_str}  \u2192  N/A")
+                _tcl = _color_odds_line(t["colors"], rtype, indent="      ")
+                if _tcl:
+                    lines.append(_tcl)
 
             # Exact group subtotal
             if all_exact_doors:
                 p_m, p_c = self.compute_enhanced_p(all_exact_doors)
                 p_exact = p_c if p_c > 1e-15 else p_m
                 if p_exact and p_exact > 0:
+                    subtotal_idxs.append(len(lines))
                     lines.append(
                         f"    Odds from Build Exact Relic: {_fmt_pct(p_exact*100)}%"
                         f"  (~1 in {int(round(1/p_exact)):,} per relic)")
@@ -2128,13 +2524,16 @@ class RelicBuilderFrame(ttk.LabelFrame):
 
         # ── My Pool group ────────────────────────────────────────────────
         pool_entries = self._pool._entries
+        # The pool tab's colours apply to every pool entry door built below.
+        _pool_colors = self._pool.get_colors()
+        _pool_cnorm  = norm_colors(_pool_colors)
         if pool_entries:
             lines.append("  My Pool:")
             for entry in pool_entries:
                 accepted = entry["accepted"]
                 label = _entry_label(entry)
-                entry_doors = [(frozenset([p]), "entry") for p in accepted
-                               if p in pool]
+                entry_doors = [(frozenset([p]), "entry", _pool_cnorm)
+                               for p in accepted if p in pool]
                 if entry_doors:
                     p_m, p_c = self.compute_enhanced_p(entry_doors)
                     p_e = p_c if p_c > 1e-15 else p_m
@@ -2146,11 +2545,16 @@ class RelicBuilderFrame(ttk.LabelFrame):
                 else:
                     lines.append(f"    {label}  \u2192  not in {pool_name} pool")
 
+            _pcl = _color_odds_line(_pool_colors, rtype, indent="    ")
+            if _pcl:
+                lines.append(_pcl)
+
             # Pool-only subtotal (entries only, threshold applied)
             thresh = self._pool._threshold.get()
             entry_probs = []
             for entry in pool_entries:
-                ed = [(frozenset([p]), "entry") for p in entry["accepted"] if p in pool]
+                ed = [(frozenset([p]), "entry", _pool_cnorm)
+                      for p in entry["accepted"] if p in pool]
                 if ed:
                     _, p_c = self.compute_enhanced_p(ed)
                     if p_c and p_c > 0:
@@ -2158,9 +2562,11 @@ class RelicBuilderFrame(ttk.LabelFrame):
             if entry_probs and len(entry_probs) >= thresh:
                 p_pool_only = prob_at_least_k_of_pool(entry_probs, thresh)
                 if p_pool_only and p_pool_only > 0:
+                    subtotal_idxs.append(len(lines))
                     lines.append(
                         f"    Odds from My Pool (\u2265{thresh}): {_fmt_pct(p_pool_only*100)}%"
                         f"  (~1 in {int(round(1/p_pool_only)):,} per relic)")
+                    group_probs.append(p_pool_only)
             lines.append("")
 
         # ── Pairings group ───────────────────────────────────────────────
@@ -2194,6 +2600,9 @@ class RelicBuilderFrame(ttk.LabelFrame):
                     lines.append(
                         f"    {pair_label}  \u2192  {_fmt_pct(p_p*100)}%"
                         f"  (~1 in {int(round(1/p_p)):,} per relic)")
+                    _prcl = _color_odds_line(pair.get("colors"), rtype, indent="      ")
+                    if _prcl:
+                        lines.append(_prcl)
                 else:
                     lines.append(f"    {pair_label}  \u2192  not available in {pool_name} pool")
 
@@ -2202,71 +2611,58 @@ class RelicBuilderFrame(ttk.LabelFrame):
                 p_m, p_c = self.compute_enhanced_p(all_pair_doors)
                 p_pairs = p_c if p_c > 1e-15 else p_m
                 if p_pairs and p_pairs > 0:
+                    subtotal_idxs.append(len(lines))
                     lines.append(
                         f"    Odds from Pairings: {_fmt_pct(p_pairs*100)}%"
                         f"  (~1 in {int(round(1/p_pairs)):,} per relic)")
                     group_probs.append(p_pairs)
             lines.append("")
 
-        # ── Pool + Pairings combined (for threshold) ─────────────────────
-        # The pool threshold applies across entries AND pairings together
-        thresh = self._pool._threshold.get() if pool_entries or pairings else 1
-        all_pool_probs = []
-        for entry in pool_entries:
-            ed = [(frozenset([p]), "entry") for p in entry["accepted"] if p in pool]
-            if ed:
-                _, p_c = self.compute_enhanced_p(ed)
-                if p_c and p_c > 0:
-                    all_pool_probs.append(p_c)
-        for pair in pairings:
-            pd = _doors_from_pairings({"pairings": [pair], "threshold": 1}, pool)
-            if pd:
-                _, p_c = self.compute_enhanced_p(pd)
-                if p_c and p_c > 0:
-                    all_pool_probs.append(p_c)
-        if all_pool_probs and len(all_pool_probs) >= thresh:
-            p_pool_combined = prob_at_least_k_of_pool(all_pool_probs, thresh)
-            if p_pool_combined and p_pool_combined > 0:
-                group_probs = [g for g in group_probs]  # keep exact separate
-                # Replace pool+pairing entries in group_probs with combined
-                # Remove individual pool/pairing entries, add combined
-                group_probs_final = []
-                if exact_targets:
-                    # Re-get exact prob
-                    all_ed = []
-                    for t in exact_targets:
-                        all_ed.extend(_doors_from_exact(
-                            {"targets": [{"passives": t["slots"], "threshold": t["threshold"]}]},
-                            pool))
-                    if all_ed:
-                        _, p_c = self.compute_enhanced_p(all_ed)
-                        if p_c and p_c > 0:
-                            group_probs_final.append(p_c)
-                group_probs_final.append(p_pool_combined)
-                # Aggregate: P(any group matches)
-                agg = 1.0
-                for gp in group_probs_final:
-                    agg *= (1.0 - gp)
-                p_agg = 1.0 - agg
-                if p_agg > 0:
-                    lines.append(
-                        f"  Combined odds (any match): {_fmt_pct(p_agg*100)}%"
-                        f"  (~1 in {int(round(1/p_agg)):,} per relic)")
-                    self._p_per_relic = p_agg
-                else:
-                    self._p_per_relic = None
-        elif group_probs:
-            agg = 1.0
+        # ── TOTAL: P(ANY door matches) ───────────────────────────────────
+        # Built from the SAME generate_doors() the batch runs, so this number
+        # cannot drift from what the bot will actually count as a match.
+        #
+        # LOAD-BEARING — this replaced a hand-rolled aggregate that pushed
+        # every pairing into the pool list and then asked for `threshold` of
+        # them via prob_at_least_k_of_pool, i.e. "N of these pairings occur on
+        # the SAME relic".  The matching engine does the opposite:
+        # _doors_from_pairings emits one STANDALONE door per pairing and
+        # check_doors matches ANY door, so one satisfied pairing is a hit.
+        # The display modelled AND where the bot does OR, and reported a
+        # total rarer than its own most likely component (1 in 7,464,090
+        # against Pairings at 1 in 1,186).  The pool threshold applies to
+        # pool ENTRIES only — pairings never counted toward it.
+        p_agg = None
+        try:
+            from bot.door_generator import generate_doors as _gen_all
+            _all_doors = _gen_all(self.get_criteria_dict(), relic_type=rtype)
+            if _all_doors:
+                _p_m, _p_c = self.compute_enhanced_p(_all_doors)
+                p_agg = _p_c if _p_c > 1e-15 else _p_m
+        except Exception:
+            p_agg = None
+
+        # Fallback only if the door path produced nothing usable: OR the
+        # group subtotals.  Still a union, never a product.
+        if (not p_agg or p_agg <= 0) and group_probs:
+            _comp = 1.0
             for gp in group_probs:
-                agg *= (1.0 - gp)
-            p_agg = 1.0 - agg
-            if p_agg > 0:
-                lines.append(
-                    f"  Combined odds (any match): {_fmt_pct(p_agg*100)}%"
-                    f"  (~1 in {int(round(1/p_agg)):,} per relic)")
-                self._p_per_relic = p_agg
-            else:
-                self._p_per_relic = None
+                _comp *= (1.0 - gp)
+            p_agg = 1.0 - _comp
+
+        if p_agg and p_agg > 0:
+            # With a single contributing group its subtotal IS the total —
+            # drop it rather than print the same figure on two lines.
+            if len(subtotal_idxs) == 1:
+                del lines[subtotal_idxs[0]]
+            lines.append(
+                f"  TOTAL — odds of finding a relic matching any criteria:"
+                f"  {_fmt_pct(p_agg*100)}%"
+                f"  (~1 in {int(round(1/p_agg)):,} per relic)")
+            _csl = self._color_summary_line()
+            if _csl:
+                lines.append(_csl)
+            self._p_per_relic = p_agg
         else:
             self._p_per_relic = None
 
@@ -2297,17 +2693,29 @@ class RelicBuilderFrame(ttk.LabelFrame):
             except Exception:
                 pass
         try:
-            from bot.probability_engine import prob_effective_deep, prob_effective_normal
+            from bot.probability_engine import (
+                prob_effective_deep, prob_effective_normal, color_probability,
+            )
             _prob_fn = prob_effective_deep if rtype == "night" else prob_effective_normal
             complement = 1.0
             complement_match = 1.0
-            for door_set, _label in doors:
+            for door in doors:
+                # Doors are (passives, source[, colours]).  Index rather than
+                # unpack — a 2-tuple unpack here broke the moment doors gained
+                # a colour element, and smart doors are still 2-tuples.
+                door_set    = door[0]
+                door_colors = door[2] if len(door) > 2 else None
                 if rtype == "night":
                     r = _prob_fn(list(door_set), len(door_set), excluded, n_blocked)
                 else:
                     r = _prob_fn(list(door_set), len(door_set), excluded)
-                complement *= 1.0 - (r.get("p_clean") or 0.0)
-                complement_match *= 1.0 - (r.get("p_match") or 0.0)
+                # Each door is only reachable on the colours ITS target
+                # accepts, so the colour factor is per door.  None = all
+                # colours = factor 1.0.
+                p_col = (color_probability(rtype, sorted(door_colors))
+                         if door_colors else 1.0)
+                complement *= 1.0 - (r.get("p_clean") or 0.0) * p_col
+                complement_match *= 1.0 - (r.get("p_match") or 0.0) * p_col
             return (1.0 - complement_match, 1.0 - complement)
         except Exception:
             return (0.0, 0.0)

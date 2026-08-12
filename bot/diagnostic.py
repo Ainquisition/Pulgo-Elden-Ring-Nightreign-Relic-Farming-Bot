@@ -265,6 +265,9 @@ class DiagnosticLogger:
             "door_gen_calls":        0,
             "door_total_generated":  0,
             "compat_rejects":        0,
+            # Relics whose passives satisfied a door but whose colour was not
+            # accepted by that door's per-target colour selection.
+            "color_rejects":         0,
 
             # Game state
             "game_launches":         0,
@@ -1166,6 +1169,22 @@ class DiagnosticLogger:
         if n > 0:
             self._ev["compat_rejects"] += n
 
+    def log_color_reject(self, relic_name: str, relic_color: str,
+                         allowed: list, matched: list) -> None:
+        """A relic matched a door's passives but not that door's colours.
+
+        Always counted; the evidence line is written at NORMAL verbosity
+        because this is the one signal that says a colour selection is
+        costing real relics — a silent counter would leave the user unable
+        to tell a well-tuned filter from an over-tight one.
+        """
+        self._ev["color_rejects"] += 1
+        if not self._verb_at_least(VERBOSITY_NORMAL):
+            return
+        self._write(
+            f"  COLOR_REJECT  relic={relic_name!r}  color={relic_color}  "
+            f"allowed={sorted(allowed)}  matched={sorted(matched)}")
+
     # ── Game state ────────────────────────────────────────────────────────── #
 
     def log_game(self, event: str, attempt: int = 0, note: str = "") -> None:
@@ -1356,6 +1375,10 @@ class DiagnosticLogger:
             f"Door gen           : calls={e['door_gen_calls']}  "
             f"total_doors={e['door_total_generated']}  "
             f"compat_rejects={e['compat_rejects']}"
+        )
+        lines.append(
+            f"Colour rejects     : {e['color_rejects']}  "
+            f"(passives matched, colour not accepted by that target)"
         )
 
         lines.append("--- Game state ---")
