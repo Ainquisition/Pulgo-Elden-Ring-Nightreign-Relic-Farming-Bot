@@ -309,13 +309,11 @@ class BotOverlay:
         # branching, so no other mode's stats section changes shape.
         sv("run_start_murk",    "—")
         sv("branch_start_murk", "—")
-        sv("branch_spent_murk", "—")
         if self._branching_mode:
             r3 = tk.Frame(stats_sec, bg=_BG)
             r3.pack(fill="x", padx=10, pady=2)
             _stat(r3, "Run Start",    self._sv["run_start_murk"],    _GOLD)
             _stat(r3, "Branch Start", self._sv["branch_start_murk"], _CYAN)
-            _stat(r3, "Spent",        self._sv["branch_spent_murk"], _WARN_C)
 
         # ── Rolls section (hit counters + best batches) ─────────────── #
         rolls_sec = _section_frame(w, with_sep=True)
@@ -337,14 +335,17 @@ class BotOverlay:
             tk.Label(cell, text=label, bg=_BG, fg=_DIM,
                      font=("Consolas", 8)).pack()
             if not self._async_mode and not self._backlog_mode:
+                # One number per category. The "all time" row underneath was
+                # the SAME value again: `_ov_hits_33` and `_ov_at_33` are
+                # incremented on the same line at every call site, decremented
+                # together on rollback, and reset only at run start, so the two
+                # rows could never differ. `key_all` stays registered so every
+                # existing push still resolves.
+                sv(key_all, "0")
                 tk.Label(cell, text="this run", bg=_BG, fg=_DIM,
                          font=("Consolas", 7)).pack()
                 tk.Label(cell, textvariable=sv(key_run, "0"), bg=_BG, fg=color,
                          font=("Consolas", 22, "bold")).pack()
-                tk.Label(cell, text="all time", bg=_BG, fg=_DIM,
-                         font=("Consolas", 7)).pack(pady=(4, 0))
-                tk.Label(cell, textvariable=sv(key_all, "0"), bg=_BG, fg=color,
-                         font=("Consolas", 14, "bold")).pack()
             else:
                 tk.Label(cell, textvariable=sv(key_all, "0"), bg=_BG, fg=color,
                          font=("Consolas", 22, "bold")).pack()

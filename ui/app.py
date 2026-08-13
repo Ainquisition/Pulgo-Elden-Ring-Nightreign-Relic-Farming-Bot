@@ -3445,8 +3445,6 @@ class RelicBotApp(tk.Tk):
         _rs, _bs = self._run_start_murk, self._branch_start_murk
         _kw["run_start_murk"]    = f"{_rs:,}" if _rs is not None else "—"
         _kw["branch_start_murk"] = f"{_bs:,}" if _bs is not None else "—"
-        _kw["branch_spent_murk"] = (
-            f"{_rs - _bs:,}" if (_rs is not None and _bs is not None) else "—")
         ov = self._overlay
         self.after(0, lambda _k=_kw: ov.update(**_k) if ov._win else None)
 
