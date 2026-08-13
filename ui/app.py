@@ -784,6 +784,8 @@ class RelicBotApp(tk.Tk):
         self._branch_on_path                  = RelicBotApp._branch_empty_tally()
         self._branch_found                    = RelicBotApp._branch_empty_tally()
         self._branch_iter_tally               = RelicBotApp._branch_empty_tally()
+        self._branch_start_murk               = None
+        self._run_start_murk                  = None
         self._branch_low_murk_strikes         = 0
         self._iter_input_drop_count      = 0
         self._iter_gpu_aa_suppressed     = False
@@ -3313,6 +3315,10 @@ class RelicBotApp(tk.Tk):
         self._branch_on_path    = RelicBotApp._branch_empty_tally()
         self._branch_found      = RelicBotApp._branch_empty_tally()
         self._branch_iter_tally = RelicBotApp._branch_empty_tally()
+        # None until Phase 0 reads the counter for real — never seeded with a
+        # guess, so the overlay shows "—" rather than a number nobody measured.
+        self._branch_start_murk = None
+        self._run_start_murk    = None
 
     @staticmethod
     def _branch_empty_tally() -> dict:
@@ -3391,6 +3397,27 @@ class RelicBotApp(tk.Tk):
         for _tk, _tv in self._branch_iter_tally.items():
             self._branch_on_path[_tk] = self._branch_on_path.get(_tk, 0) + _tv
 
+    def _branch_record_murk_baseline(self, murk_val: int) -> None:
+        """Record the murk this branch's save restores with.
+
+        Called from the one place `_global_murk_expected` is established, which
+        is the first iteration of the run and the first iteration of each new
+        branch — the split clears the baseline precisely so it re-reads from
+        the new branch's save. Within a branch every iteration restores the
+        same file, so this value is constant until the next split.
+
+        The staircase only ever descends: a split permanently spends whatever
+        the creator iteration consumed, so `run start - branch start` is the
+        murk this run has committed and is what actually ends the run. The
+        iteration limit rarely does.
+        """
+        if not self._eff_branching():
+            return
+        self._branch_start_murk = murk_val
+        if self._run_start_murk is None:
+            self._run_start_murk = murk_val
+        self._push_branch_overlay()
+
     def _push_branch_overlay(self) -> None:
         """Send branch identity + the on-branch/run-wide split to the overlay.
 
@@ -3413,6 +3440,13 @@ class RelicBotApp(tk.Tk):
                 ("excl",      "excl_hits",      "excl_found")):
             _kw[_var_kept]  = f"{self._branch_on_path.get(_key, 0)} on branch"
             _kw[_var_found] = f"({self._branch_found.get(_key, 0)} found)"
+        # Murk staircase. Rendered as "—" until Phase 0 has actually read the
+        # counter, rather than guessing a starting figure.
+        _rs, _bs = self._run_start_murk, self._branch_start_murk
+        _kw["run_start_murk"]    = f"{_rs:,}" if _rs is not None else "—"
+        _kw["branch_start_murk"] = f"{_bs:,}" if _bs is not None else "—"
+        _kw["branch_spent_murk"] = (
+            f"{_rs - _bs:,}" if (_rs is not None and _bs is not None) else "—")
         ov = self._overlay
         self.after(0, lambda _k=_kw: ov.update(**_k) if ov._win else None)
 
@@ -10476,6 +10510,10 @@ class RelicBotApp(tk.Tk):
                         # save the current branch actually restores from.
                         if self._global_murk_expected is None:
                             self._global_murk_expected = murk_val
+                            # Same moment, by construction: the baseline is
+                            # None exactly on the first iteration of the run
+                            # and on the first iteration of every new branch.
+                            self._branch_record_murk_baseline(murk_val)
                         elif murk_val != self._global_murk_expected:
                             # One retry to rule out OCR noise before aborting.
                             self._log(

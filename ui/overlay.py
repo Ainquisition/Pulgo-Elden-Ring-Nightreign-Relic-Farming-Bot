@@ -302,6 +302,21 @@ class BotOverlay:
         _stat(r2, "Relic #",   sv("relic_num"),  _FG)
         _stat(r2, "Analysing", sv("analysing"),  _FG)
 
+        # Branching Mode: the murk staircase. Every split permanently spends
+        # what its creator iteration consumed, so each branch starts poorer
+        # than its parent and the run is self-limiting on murk rather than on
+        # the iteration cap. Registered unconditionally, packed only while
+        # branching, so no other mode's stats section changes shape.
+        sv("run_start_murk",    "—")
+        sv("branch_start_murk", "—")
+        sv("branch_spent_murk", "—")
+        if self._branching_mode:
+            r3 = tk.Frame(stats_sec, bg=_BG)
+            r3.pack(fill="x", padx=10, pady=2)
+            _stat(r3, "Run Start",    self._sv["run_start_murk"],    _GOLD)
+            _stat(r3, "Branch Start", self._sv["branch_start_murk"], _CYAN)
+            _stat(r3, "Spent",        self._sv["branch_spent_murk"], _WARN_C)
+
         # ── Rolls section (hit counters + best batches) ─────────────── #
         rolls_sec = _section_frame(w, with_sep=True)
         _reg("rolls", rolls_sec, fill="x")
