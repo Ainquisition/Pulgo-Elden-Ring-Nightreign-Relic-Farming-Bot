@@ -855,6 +855,10 @@ class RelicBotApp(tk.Tk):
         self.after(200, self._log_screen_resolution)
         self.after(300, self._log_calibration_status)
         self.after(600, self._prompt_install_health)
+        # Release check runs after the health prompt so a damaged install is
+        # dealt with first, and late enough that it can never delay the window
+        # appearing. It only ever recolours the Update button.
+        self.after(2500, self._start_update_check)
         self.deiconify()   # show window now that icon is set and UI is fully built
 
     # ------------------------------------------------------------------ #
@@ -936,6 +940,8 @@ class RelicBotApp(tk.Tk):
             profile_frame, text="Update", command=self._run_updater,
         )
         _update_btn.grid(row=0, column=7, **pad)
+        # Held on self so the background release check can recolour it.
+        self._update_btn = _update_btn
         if _update_channel() == "nexus":
             _update_tip = (
                 "Install a RelicBot update you downloaded from NexusMods.\n"
@@ -3667,6 +3673,56 @@ class RelicBotApp(tk.Tk):
         })
         with _ur.urlopen(req, timeout=20) as resp:
             return _json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    # ── Silent start-up release check ───────────────────────────────────── #
+
+    def _start_update_check(self) -> None:
+        """Ask GitHub once, in the background, whether a newer release exists.
+
+        Non-intrusive by design: the ONLY outcome is the Update button turning
+        gold and its tooltip naming the new version. No popup, no dialog, no
+        log line the user has to dismiss, and nothing that can interrupt a run.
+
+        LOAD-BEARING: never runs on the `nexus` channel. That package must not
+        contact GitHub at all — the whole reason the two-package split exists —
+        and a silent check would be exactly the off-site call the compliance
+        rule forbids, made without the user asking. `_BUILD_IS_CE` is fine: it
+        reads its own versionless tag through the same helper.
+
+        Every failure is silent. Offline, rate-limited, DNS-blocked, garbage
+        tag: the button simply stays as it was. A start-up check that nags on
+        failure is worse than no check.
+        """
+        if _update_channel() == "nexus":
+            return
+        threading.Thread(target=self._update_check_worker,
+                         daemon=True, name="update-check").start()
+
+    def _update_check_worker(self) -> None:
+        """Background half of the start-up check. Never raises, never blocks."""
+        try:
+            meta = self._fetch_release_meta()
+            tag = str(meta.get("tag_name") or "")
+            remote = self._version_tuple(tag)
+            local = self._version_tuple(APP_VERSION)
+            # An unparseable remote tag means "cannot compare", never "newer" —
+            # the same rule _run_updater applies before offering a download.
+            if remote and local and remote > local:
+                self.after(0, lambda t=tag: self._mark_update_available(t))
+        except Exception:
+            pass   # silent by contract
+
+    def _mark_update_available(self, tag: str) -> None:
+        """Main-thread half: recolour the Update button and retitle its tip."""
+        try:
+            btn = getattr(self, "_update_btn", None)
+            if btn is None or not btn.winfo_exists():
+                return
+            btn.configure(style="UpdateAvailable.TButton")
+            self._log(f"A newer release is available ({tag}). "
+                      f"Click Update when you are ready — nothing happens until you do.")
+        except Exception:
+            pass
 
     def _run_updater(self, repair: bool = False, force: bool = False) -> None:
         """Entry point for the profile-row Update button.
