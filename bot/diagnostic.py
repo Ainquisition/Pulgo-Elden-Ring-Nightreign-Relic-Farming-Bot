@@ -199,6 +199,7 @@ class DiagnosticLogger:
             "buy_qty_corrected_esc": 0,
             "buy_qty_unrecoverable": 0,
             "buy_qty_shop_depleted": 0,
+            "buy_qty_inventory_max": 0,
             "buy_qty_ocr_fail":      0,
             "buy_qty_drift_detected": 0,
             "buy_qty_fallback_murk": 0,
@@ -822,6 +823,12 @@ class DiagnosticLogger:
                          (got/n_cap/cost all zero) — the shop ran out of the
                          targeted item.  Iteration ends gracefully; relics
                          scanned in earlier cycles are preserved.  WARN.
+        inventory_max  — the game refused the purchase with "Cannot purchase
+                         due to inventory maximum": relic storage is full.
+                         Treated exactly like running out of murk — the buy
+                         loop stops and the iteration ENDS SUCCESSFULLY with
+                         everything bought so far kept and analysed.  Not a
+                         failure; the user simply cannot hold more relics.
         unrecoverable  — ESC reset returned inconsistent/garbage data (dialog
                          opened but OCR failed to read it).  Genuine bug or
                          game bug — warrants investigation.  ERROR.
