@@ -778,6 +778,14 @@ class RelicBotApp(tk.Tk):
         self._branch_latest_creator_dir: str  = ""
         self._branch_double_letter_active     = False  # True after 26-branch rename pass
         self._branch_out_of_murk              = False
+        # Overlay tallies — see _branch_reset_state, which is what actually
+        # arms them at batch start. Declared here so any read before a run
+        # resolves rather than raising.
+        self._branch_on_path                  = RelicBotApp._branch_empty_tally()
+        self._branch_found                    = RelicBotApp._branch_empty_tally()
+        self._branch_iter_tally               = RelicBotApp._branch_empty_tally()
+        self._branch_start_murk               = None
+        self._run_start_murk                  = None
         self._branch_low_murk_strikes         = 0
         self._iter_input_drop_count      = 0
         self._iter_gpu_aa_suppressed     = False
@@ -3292,6 +3300,153 @@ class RelicBotApp(tk.Tk):
         # iterations so one bad OCR read can't end the run on its own.
         self._branch_out_of_murk              = False
         self._branch_low_murk_strikes         = 0
+        # Category tallies for the overlay's on-branch vs run-wide split.
+        # `_branch_on_path` counts only what survives into the save chain:
+        # a HIT/GOD ROLL makes its iteration the branch creator, and that
+        # iteration's save becomes the next branch's restore source, so
+        # everything it found is carried forward. Every other iteration is
+        # restored away, taking its smart hits / near misses / excluded hits
+        # with it. `_branch_found` is the run-wide total for the same
+        # categories, so both numbers come from one source in one place.
+        # Resolved off the CLASS, not `self`: test_branching.py drives
+        # _branch_reset_state from its own BranchHarness object, which is not a
+        # RelicBotApp and has no such attribute. Going through self coupled
+        # this method to the caller's type and broke that harness outright.
+        self._branch_on_path    = RelicBotApp._branch_empty_tally()
+        self._branch_found      = RelicBotApp._branch_empty_tally()
+        self._branch_iter_tally = RelicBotApp._branch_empty_tally()
+        # None until Phase 0 reads the counter for real — never seeded with a
+        # guess, so the overlay shows "—" rather than a number nobody measured.
+        self._branch_start_murk = None
+        self._run_start_murk    = None
+
+    @staticmethod
+    def _branch_empty_tally() -> dict:
+        """Zeroed category tally. One definition so the three users can't drift."""
+        return {"smart": 0, "near_miss": 0, "excl": 0, "relics": 0}
+
+    @staticmethod
+    def _branch_tally_results(relic_results: list) -> dict:
+        """Count this iteration's categories straight off `relic_results`.
+
+        Reads the `_category` each relic was stamped with when it was
+        classified, so this can never disagree with the categorisation the
+        run acted on. Deliberately NOT derived from the `_ov_*` overlay
+        counters: those are incremented from several call sites and are not
+        a per-iteration quantity.
+        """
+        tally = RelicBotApp._branch_empty_tally()
+        for _r in relic_results or []:
+            if not isinstance(_r, dict):
+                continue
+            tally["relics"] += 1
+            _cat = _r.get("_category")
+            if _cat in ("SMART", "SMART_GOD_ROLL"):
+                tally["smart"] += 1
+            elif _cat == "NEAR_MISS":
+                tally["near_miss"] += 1
+            elif _cat == "EXCLUDED":
+                tally["excl"] += 1
+        return tally
+
+    def _branch_trail_parts(self) -> tuple[str, str, str]:
+        """Header strings: (trail behind, current branch, depth/position).
+
+        The trail is derived from `_branch_current_index` on every call rather
+        than accumulated, so the 26-branch rename pass (A→AA, B→AB, …) is
+        picked up automatically instead of leaving a stale cached trail.
+        """
+        _idx = self._branch_current_index
+        _letters = [
+            self._branch_letter_for_index(
+                i, force_double=self._branch_double_letter_active)
+            for i in range(_idx + 1)
+        ]
+        _here = _letters[-1]
+        _behind = _letters[:-1]
+        # A deep run would otherwise push the batch counter out of the header.
+        # Only bites past 12 branches; the murk economics make that unlikely
+        # (5 splits consumed an entire 764k budget in the one real run).
+        if len(_behind) > 11:
+            _behind = _behind[:1] + ["…"] + _behind[-9:]
+        _trail = "".join(f"{p} › " for p in _behind)
+        _depth = f"{_idx} deep · iter {self._branch_position + 1} of branch"
+        return _trail, _here, _depth
+
+    def _branch_record_iter_tally(self, relic_results: list) -> None:
+        """Tally what this iteration found and add it to the run-wide totals.
+
+        Held in `_branch_iter_tally` rather than folded into `_branch_on_path`
+        straight away, because whether these relics survive is not known until
+        the branch-advance block decides if this iteration is the creator.
+        """
+        self._branch_iter_tally = self._branch_tally_results(relic_results)
+        for _tk, _tv in self._branch_iter_tally.items():
+            self._branch_found[_tk] = self._branch_found.get(_tk, 0) + _tv
+
+    def _branch_promote_iter_tally(self) -> None:
+        """Fold the held tally into the on-branch totals — creator iterations only.
+
+        LOAD-BEARING: call this ONLY from the `_branch_creator_pending` arm of
+        the branch-advance block. This iteration's save becomes the next
+        branch's restore source, which is the only way a smart hit, near miss
+        or excluded hit survives — none of them trigger a split on their own.
+        Every non-creator iteration is restored away and its tally is dropped
+        by never being promoted.
+        """
+        for _tk, _tv in self._branch_iter_tally.items():
+            self._branch_on_path[_tk] = self._branch_on_path.get(_tk, 0) + _tv
+
+    def _branch_record_murk_baseline(self, murk_val: int) -> None:
+        """Record the murk this branch's save restores with.
+
+        Called from the one place `_global_murk_expected` is established, which
+        is the first iteration of the run and the first iteration of each new
+        branch — the split clears the baseline precisely so it re-reads from
+        the new branch's save. Within a branch every iteration restores the
+        same file, so this value is constant until the next split.
+
+        The staircase only ever descends: a split permanently spends whatever
+        the creator iteration consumed, so `run start - branch start` is the
+        murk this run has committed and is what actually ends the run. The
+        iteration limit rarely does.
+        """
+        if not self._eff_branching():
+            return
+        self._branch_start_murk = murk_val
+        if self._run_start_murk is None:
+            self._run_start_murk = murk_val
+        self._push_branch_overlay()
+
+    def _push_branch_overlay(self) -> None:
+        """Send branch identity + the on-branch/run-wide split to the overlay.
+
+        LOAD-BEARING: gated on `_eff_branching()`, never the raw var, so a
+        ticked-but-inert Branching checkbox cannot relabel an Async run's
+        overlay.
+
+        While branching, this is the SOLE writer of the smart / near-miss /
+        excluded StringVars — the raw per-iteration pushes are suppressed for
+        the same reason (see their call sites). Two writers would race and the
+        formatted "N on branch" string would flicker back to a bare integer.
+        """
+        if not self._overlay or not self._eff_branching():
+            return
+        _trail, _here, _depth = self._branch_trail_parts()
+        _kw = {"branch_trail": _trail, "branch_here": _here, "branch_depth": _depth}
+        for _key, _var_kept, _var_found in (
+                ("smart",     "smart_hits",     "smart_found"),
+                ("near_miss", "near_miss_hits", "near_miss_found"),
+                ("excl",      "excl_hits",      "excl_found")):
+            _kw[_var_kept]  = f"{self._branch_on_path.get(_key, 0)} on branch"
+            _kw[_var_found] = f"({self._branch_found.get(_key, 0)} found)"
+        # Murk staircase. Rendered as "—" until Phase 0 has actually read the
+        # counter, rather than guessing a starting figure.
+        _rs, _bs = self._run_start_murk, self._branch_start_murk
+        _kw["run_start_murk"]    = f"{_rs:,}" if _rs is not None else "—"
+        _kw["branch_start_murk"] = f"{_bs:,}" if _bs is not None else "—"
+        ov = self._overlay
+        self.after(0, lambda _k=_kw: ov.update(**_k) if ov._win else None)
 
     def _branch_current_letter(self) -> str:
         """Convenience: current branch's letter, accounting for double-letter rename."""
@@ -5486,6 +5641,7 @@ class RelicBotApp(tk.Tk):
             self._overlay = BotOverlay(self)
             self._overlay.build(sw, sh, async_mode=self._eff_async(),
                                 backlog_mode=self._eff_backlog(),
+                                branching_mode=self._eff_branching(),
                                 settings=self._get_ov_settings())
             self._overlay.set_reset_iter_callback(self._request_reset_iter)
             self._overlay.set_stop_callback(self._request_stop_after_batch)
@@ -5501,6 +5657,9 @@ class RelicBotApp(tk.Tk):
                 best_33=_fmt_best(self._best_33_iter, "★★★"),
                 best_hits=_fmt_best(self._best_hits_iter, "hits"),
             )
+            # Seed the branch header so iteration 1 reads "# · 0 deep" rather
+            # than sitting blank until the first branch is created.
+            self._push_branch_overlay()
             self._overlay.start_game_watch(
                 getattr(self, "_overlay_exe_frag", "nightreign"))
         self._ready_event.set()
@@ -8026,7 +8185,10 @@ class RelicBotApp(tk.Tk):
             # Update excluded hits overlay counter
             if _excl_match_results:
                 self._ov_excl_hits += len(_excl_match_results)
-                if self._overlay:
+                # While branching, _push_branch_overlay owns this StringVar and
+                # writes it as "N on branch". Only the display is suppressed —
+                # the counter itself still feeds the run summary.
+                if self._overlay and not self._eff_branching():
                     _eh = self._ov_excl_hits
                     self.after(0, lambda _eh=_eh:
                                self._overlay.update(excl_hits=_eh)
@@ -8093,7 +8255,8 @@ class RelicBotApp(tk.Tk):
                 # Correct dud counters (near miss relics were counted as duds per-relic)
                 self._ov_duds    = max(0, self._ov_duds - len(_nm_results))
                 self._ov_at_duds = max(0, self._ov_at_duds - len(_nm_results))
-                if self._overlay:
+                # See the excluded-hits note above — same single-writer rule.
+                if self._overlay and not self._eff_branching():
                     _nmh = self._ov_near_miss_hits
                     self.after(0, lambda _nmh=_nmh:
                                self._overlay.update(near_miss_hits=_nmh)
@@ -8102,6 +8265,16 @@ class RelicBotApp(tk.Tk):
             # Track "good" iterations — any with a HIT, GOD ROLL, excluded hit, or smart hit
             if num_matched >= 1 or _excl_match_results:
                 self._good_iterations.add(iteration)
+
+            # Branching Mode: tally what THIS iteration found, before the
+            # branch state advances below. Counted off `relic_results` via the
+            # `_category` each relic was stamped with at classification time,
+            # so it cannot disagree with what the run acted on. Held aside
+            # rather than folded in immediately: whether these relics survive
+            # depends on this iteration becoming the branch creator, which is
+            # decided in the block directly below.
+            if self._eff_branching():
+                self._branch_record_iter_tally(relic_results)
 
             # Deferred save copy — set AFTER any rename so the path is always valid
             _prev_save_dir = iter_dir
@@ -8145,6 +8318,7 @@ class RelicBotApp(tk.Tk):
                     self._branch_current_reset_path = os.path.join(
                         iter_dir, save_filename)
                     self._branch_creator_pending = False
+                    self._branch_promote_iter_tally()
                     # The new branch's save holds LESS murk than the previous
                     # one — this iteration spent some buying the relics that
                     # produced the match. Phase 0's anti-drift guard compares
@@ -8172,6 +8346,10 @@ class RelicBotApp(tk.Tk):
                             pass
                 else:
                     self._branch_position += 1
+                # Refresh after the state advance either way, so the trail
+                # grows the moment a branch is created and the in-branch
+                # iteration counter ticks on every other iteration.
+                self._push_branch_overlay()
 
             results.append({
                 "iteration": iteration,
@@ -10330,6 +10508,10 @@ class RelicBotApp(tk.Tk):
                         # save the current branch actually restores from.
                         if self._global_murk_expected is None:
                             self._global_murk_expected = murk_val
+                            # Same moment, by construction: the baseline is
+                            # None exactly on the first iteration of the run
+                            # and on the first iteration of every new branch.
+                            self._branch_record_murk_baseline(murk_val)
                         elif murk_val != self._global_murk_expected:
                             # One retry to rule out OCR noise before aborting.
                             self._log(

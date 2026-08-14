@@ -165,6 +165,7 @@ class BotOverlay:
         self._overflow_hits_frame: tk.Frame | None = None
         self._stop_pending   = False
         self._matches_view   = False
+        self._branching_mode = False
 
         # Drag-to-move state
         self._drag_x = 0
@@ -201,13 +202,15 @@ class BotOverlay:
     def build(self, screen_w: int, screen_h: int,
               async_mode: bool = False,
               backlog_mode: bool = False,
+              branching_mode: bool = False,
               settings: dict | None = None) -> None:
         """Create the overlay window, positioned bottom-left of the screen."""
         if self._win:
             return
 
-        self._async_mode   = async_mode
-        self._backlog_mode = backlog_mode
+        self._async_mode     = async_mode
+        self._backlog_mode   = backlog_mode
+        self._branching_mode = branching_mode
 
         if settings:
             for key in self._section_visible:
@@ -251,6 +254,27 @@ class BotOverlay:
 
         tk.Label(hdr, text="⚙ RELIC BOT", bg=_BG, fg=_GOLD,
                  font=("Consolas", 10, "bold"), cursor="fleur").pack(side="left")
+
+        # Branching Mode: the chain of branches walked so far, with the branch
+        # currently being farmed highlighted.  Three labels rather than one so
+        # the current branch can be coloured differently from the trail behind
+        # it.  Registered unconditionally so update() always resolves the keys;
+        # the widgets only exist in branching mode, leaving every other mode's
+        # header byte-identical to before.
+        sv("branch_trail", "")
+        sv("branch_here",  "")
+        sv("branch_depth", "")
+        if self._branching_mode:
+            tk.Label(hdr, textvariable=self._sv["branch_trail"],
+                     bg=_BG, fg=_DIM, font=("Consolas", 9),
+                     cursor="fleur").pack(side="left", padx=(12, 0))
+            tk.Label(hdr, textvariable=self._sv["branch_here"],
+                     bg=_BG, fg=_CYAN, font=("Consolas", 9, "bold"),
+                     cursor="fleur").pack(side="left")
+            tk.Label(hdr, textvariable=self._sv["branch_depth"],
+                     bg=_BG, fg=_DIM, font=("Consolas", 8),
+                     cursor="fleur").pack(side="left", padx=(8, 0))
+
         tk.Label(hdr, textvariable=sv("batch", "—"),
                  bg=_BG, fg=_DIM, font=("Consolas", 9), cursor="fleur").pack(side="right")
         tk.Label(hdr, textvariable=sv("mode_tag", ""),
@@ -278,6 +302,19 @@ class BotOverlay:
         _stat(r2, "Relic #",   sv("relic_num"),  _FG)
         _stat(r2, "Analysing", sv("analysing"),  _FG)
 
+        # Branching Mode: the murk staircase. Every split permanently spends
+        # what its creator iteration consumed, so each branch starts poorer
+        # than its parent and the run is self-limiting on murk rather than on
+        # the iteration cap. Registered unconditionally, packed only while
+        # branching, so no other mode's stats section changes shape.
+        sv("run_start_murk",    "—")
+        sv("branch_start_murk", "—")
+        if self._branching_mode:
+            r3 = tk.Frame(stats_sec, bg=_BG)
+            r3.pack(fill="x", padx=10, pady=2)
+            _stat(r3, "Run Start",    self._sv["run_start_murk"],    _GOLD)
+            _stat(r3, "Branch Start", self._sv["branch_start_murk"], _CYAN)
+
         # ── Rolls section (hit counters + best batches) ─────────────── #
         rolls_sec = _section_frame(w, with_sep=True)
         _reg("rolls", rolls_sec, fill="x")
@@ -298,14 +335,17 @@ class BotOverlay:
             tk.Label(cell, text=label, bg=_BG, fg=_DIM,
                      font=("Consolas", 8)).pack()
             if not self._async_mode and not self._backlog_mode:
+                # One number per category. The "all time" row underneath was
+                # the SAME value again: `_ov_hits_33` and `_ov_at_33` are
+                # incremented on the same line at every call site, decremented
+                # together on rollback, and reset only at run start, so the two
+                # rows could never differ. `key_all` stays registered so every
+                # existing push still resolves.
+                sv(key_all, "0")
                 tk.Label(cell, text="this run", bg=_BG, fg=_DIM,
                          font=("Consolas", 7)).pack()
                 tk.Label(cell, textvariable=sv(key_run, "0"), bg=_BG, fg=color,
                          font=("Consolas", 22, "bold")).pack()
-                tk.Label(cell, text="all time", bg=_BG, fg=_DIM,
-                         font=("Consolas", 7)).pack(pady=(4, 0))
-                tk.Label(cell, textvariable=sv(key_all, "0"), bg=_BG, fg=color,
-                         font=("Consolas", 14, "bold")).pack()
             else:
                 tk.Label(cell, textvariable=sv(key_all, "0"), bg=_BG, fg=color,
                          font=("Consolas", 22, "bold")).pack()
@@ -341,6 +381,8 @@ class BotOverlay:
                  font=("Consolas", 8, "bold"), width=11, anchor="w").pack(side="left")
         tk.Label(self._row_nearmiss, textvariable=sv("near_miss_hits", "0"), bg=_BG, fg=_FG,
                  font=("Consolas", 8)).pack(side="left")
+        tk.Label(self._row_nearmiss, textvariable=sv("near_miss_found", ""), bg=_BG, fg=_DIM,
+                 font=("Consolas", 8)).pack(side="left", padx=(6, 0))
 
         self._row_smart = tk.Frame(bb, bg=_BG)
         self._row_smart.pack(fill="x", pady=1)
@@ -348,6 +390,8 @@ class BotOverlay:
                  font=("Consolas", 8, "bold"), width=11, anchor="w").pack(side="left")
         tk.Label(self._row_smart, textvariable=sv("smart_hits", "0"), bg=_BG, fg=_FG,
                  font=("Consolas", 8)).pack(side="left")
+        tk.Label(self._row_smart, textvariable=sv("smart_found", ""), bg=_BG, fg=_DIM,
+                 font=("Consolas", 8)).pack(side="left", padx=(6, 0))
 
         self._row_excl = tk.Frame(bb, bg=_BG)
         self._row_excl.pack(fill="x", pady=1)
@@ -355,6 +399,8 @@ class BotOverlay:
                  font=("Consolas", 8, "bold"), width=11, anchor="w").pack(side="left")
         tk.Label(self._row_excl, textvariable=sv("excl_hits", "0"), bg=_BG, fg=_FG,
                  font=("Consolas", 8)).pack(side="left")
+        tk.Label(self._row_excl, textvariable=sv("excl_found", ""), bg=_BG, fg=_DIM,
+                 font=("Consolas", 8)).pack(side="left", padx=(6, 0))
 
         # ── Overflow hits section ────────────────────────────────────── #
         # Invisible when count = 0; lights up when old-batch overflow workers
