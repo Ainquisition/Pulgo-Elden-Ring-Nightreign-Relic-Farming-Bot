@@ -10300,6 +10300,39 @@ class RelicBotApp(tk.Tk):
     #  PHASE EXECUTION ENGINE
     # ------------------------------------------------------------------ #
 
+    def _qty_from_required_murk(self, qty_cost, expected, murk_cost=None):
+        """Derive the buy quantity from the dialog's Required Murk.
+
+        Used when the X/N OCR returns nothing on a dialog that is plainly open
+        and readable — a documented failure mode: `buy_qty_fallback_murk` fired
+        49 times in a single run, and a field dump showed a legible "2/ 2" read
+        back as None at confidence 0.000 while the cost region parsed 3,600
+        correctly.
+
+        LOAD-BEARING — divides by the relic-type cost FIRST. The learned
+        `_per_relic_murk_cost` is computed as `cycle_cost // batch_size`, so it
+        inherits any error in the very quantity this exists to replace. That is
+        the same divisor trap the buy-count reconciliation was explicitly fixed
+        for; the learned value is kept only as a second chance for the case
+        where the relic-type cost is unavailable.
+
+        Returns None rather than a guess: the caller must only ever accept a
+        derived count that AGREES with what it already expected.
+        """
+        if not qty_cost or not expected or expected <= 0:
+            return None
+        # `self.__dict__.get`, not `getattr`: this class subclasses tk.Tk, whose
+        # __getattr__ forwards unknown names to self.tk. On an instance built
+        # with __new__ (how every harness here drives these methods) that
+        # recurses until RecursionError — and the getattr default never applies,
+        # because the failure is not AttributeError.
+        _learned = self.__dict__.get("_per_relic_murk_cost")
+        for _cost in (murk_cost, _learned):
+            if _cost and _cost > 0 and qty_cost % _cost == 0:
+                if qty_cost // _cost == expected:
+                    return expected
+        return None
+
     def _run_iteration_phases(self, label: str, criteria: dict,
                               region,
                               iter_dir: str = "", hit_min: int = 2,
@@ -11005,28 +11038,26 @@ class RelicBotApp(tk.Tk):
                             _accepted = True
                             _actual_batch_size = _qty_x
                         elif _qty_x is None:
-                            # Fallback: derive X from required-murk (needs known cost)
-                            _per_cost = getattr(self, "_per_relic_murk_cost", None)
-                            if (_qty_cost is not None and _per_cost
-                                    and _per_cost > 0
-                                    and _qty_cost % _per_cost == 0):
-                                _x_from_cost = _qty_cost // _per_cost
-                                if _x_from_cost == _batch_size:
-                                    _accepted = True
-                                    _via_fallback = True
-                                    _actual_batch_size = _x_from_cost
-                                    if self._diag:
-                                        try:
-                                            self._diag.log_buy_qty(
-                                                event="fallback_murk",
-                                                cycle=_batch_i + 1,
-                                                expected=_batch_size,
-                                                got=_x_from_cost,
-                                                n_cap=_batch_size,
-                                                cost=_qty_cost,
-                                                attempt=_qty_attempt + 1)
-                                        except Exception:
-                                            pass
+                            # Fallback: derive X from required-murk. Shared with
+                            # the post-ESC retry below so the two cannot drift.
+                            _x_from_cost = self._qty_from_required_murk(
+                                _qty_cost, _batch_size, murk_cost)
+                            if _x_from_cost is not None:
+                                _accepted = True
+                                _via_fallback = True
+                                _actual_batch_size = _x_from_cost
+                                if self._diag:
+                                    try:
+                                        self._diag.log_buy_qty(
+                                            event="fallback_murk",
+                                            cycle=_batch_i + 1,
+                                            expected=_batch_size,
+                                            got=_x_from_cost,
+                                            n_cap=_batch_size,
+                                            cost=_qty_cost,
+                                            attempt=_qty_attempt + 1)
+                                    except Exception:
+                                        pass
                             if not _accepted and self._diag:
                                 try:
                                     self._diag.log_buy_qty(
@@ -11324,6 +11355,41 @@ class RelicBotApp(tk.Tk):
                                         cost=_qty_cost or 0)
                                 except Exception:
                                     pass
+                            _qty_ok = True
+                        elif self._qty_from_required_murk(
+                                _qty_cost, _batch_size, murk_cost) is not None:
+                            # SAME fallback the first read gets. It was missing
+                            # here, and that omission is what ended both aborted
+                            # iterations of batch_run_2026-08-13_010953: the
+                            # dialog was open and legibly showing "2/ 2", the
+                            # cost region parsed 3,600 with batch_size 2, and
+                            # 3600 // 1800 == 2 would have accepted it — but
+                            # this path required a non-None X and fell through
+                            # to "unrecoverable" instead.
+                            #
+                            # The recurring shape: a fix landed on one call path
+                            # and not its sibling. `buy_qty_fallback_murk` fired
+                            # 49 times in one run on the path that had it.
+                            with relic_analyzer.input_gpu_yield():
+                                self.player.tap("f", hold=_p1_hold)
+                            _actual_batch_size = _batch_size
+                            if self._diag:
+                                try:
+                                    self._diag.log_buy_qty(
+                                        event="fallback_murk",
+                                        cycle=_batch_i + 1,
+                                        expected=_batch_size,
+                                        got=_actual_batch_size,
+                                        n_cap=_batch_size,
+                                        conf=_qty_conf,
+                                        cost=_qty_cost or 0,
+                                        note="post-ESC retry")
+                                except Exception:
+                                    pass
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: X/N unreadable after ESC"
+                                f" reset, but required murk ({_qty_cost:,}) matches"
+                                f" {_batch_size} relic(s) — proceeding.")
                             _qty_ok = True
                         else:
                             # Getting here means the shop screen AND the shop
