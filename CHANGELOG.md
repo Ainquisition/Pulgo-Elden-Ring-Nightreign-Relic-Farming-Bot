@@ -4,6 +4,50 @@ All notable changes to this project are documented here.
 
 ---
 
+## [1.9.4] — 2026-08-14 — SHOP RECOVERY, CLEARER ODDS, AND A BRANCHING OVERLAY THAT MAKES SENSE
+
+### Fixed
+- **The bot no longer gives up on a shop it can actually still use.** When a buy
+  cycle failed to start, the bot pressed on blind after resetting and, if that
+  went nowhere, declared the shop empty and ended the iteration as a success.
+  In one 36-iteration run that ended six iterations early and cost roughly 1,700
+  relics — every one of them reported as fine. It now confirms it is back at the
+  bazaar, on the right item, with its murk untouched, before buying anything, and
+  it will not buy at all if any of those checks fail. Running out of murk is now
+  the only thing that ends an iteration for being out of stock.
+- **A full relic inventory is no longer mistaken for an empty shop.** When the
+  game refuses a purchase with "Cannot purchase due to inventory maximum", the
+  bot stops buying, keeps everything it already bought and analysed, and ends the
+  iteration successfully — the same as running out of murk. Previously it retried
+  into the message, then reported the shop as empty, every iteration, for the rest
+  of the run.
+- **A cycle is no longer abandoned when the quantity is readable another way.**
+  If the quantity text will not read after a reset, the required-murk figure is
+  used to work it out, which the first attempt already did.
+- **Pool odds no longer disappear when a pairing is added.** The pool's own
+  "at least N of M" figure now has its own line, so it stays visible instead of
+  being absorbed into the total. Pairings show their own line too. With only one
+  group configured the total is shown alone, as before.
+
+### Added
+- **The Update button turns blue when a newer release exists.** Checked quietly
+  in the background at start-up; nothing pops up, nothing interrupts a run, and
+  nothing is downloaded until you click it. The NexusMods build does not check
+  and never contacts GitHub.
+- **Branching Mode overlay rewritten around the branch you are on.** The header
+  shows the chain walked so far with the current branch highlighted, how deep you
+  are, and which iteration of that branch is running. Smart hits, near misses and
+  excluded hits now show how many survived onto your current branch alongside how
+  many were found overall — most are shed when a branch is restored, and the old
+  running totals did not say so. Also shows the murk the run started with and the
+  murk the current branch started with.
+
+### Changed
+- **The overlay no longer prints every count twice.** The "all time" row under
+  each counter always showed the same number as "this run" and has been removed.
+
+---
+
 ## [1.9.3] — 2026-08-12 — PICK RELIC COLORS PER TARGET
 
 ### Added: each target, pairing and pool chooses its own relic colors

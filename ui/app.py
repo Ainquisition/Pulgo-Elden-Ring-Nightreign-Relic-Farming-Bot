@@ -51,7 +51,7 @@ _APP_CONFIG_FILE    = os.path.join(_REPO_ROOT, "relicbot_config.json")
 
 # Single source of truth for the app version. Used in the window title and
 # embedded in diagnostic log headers so bug reports identify their build.
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 
 # Cross-flavor flag. Mainline = False, CE branch flips this to True.
 # Drives title string + support-link routing so the CE build deep-links to
@@ -778,6 +778,14 @@ class RelicBotApp(tk.Tk):
         self._branch_latest_creator_dir: str  = ""
         self._branch_double_letter_active     = False  # True after 26-branch rename pass
         self._branch_out_of_murk              = False
+        # Overlay tallies — see _branch_reset_state, which is what actually
+        # arms them at batch start. Declared here so any read before a run
+        # resolves rather than raising.
+        self._branch_on_path                  = RelicBotApp._branch_empty_tally()
+        self._branch_found                    = RelicBotApp._branch_empty_tally()
+        self._branch_iter_tally               = RelicBotApp._branch_empty_tally()
+        self._branch_start_murk               = None
+        self._run_start_murk                  = None
         self._branch_low_murk_strikes         = 0
         self._iter_input_drop_count      = 0
         self._iter_gpu_aa_suppressed     = False
@@ -847,6 +855,10 @@ class RelicBotApp(tk.Tk):
         self.after(200, self._log_screen_resolution)
         self.after(300, self._log_calibration_status)
         self.after(600, self._prompt_install_health)
+        # Release check runs after the health prompt so a damaged install is
+        # dealt with first, and late enough that it can never delay the window
+        # appearing. It only ever recolours the Update button.
+        self.after(2500, self._start_update_check)
         self.deiconify()   # show window now that icon is set and UI is fully built
 
     # ------------------------------------------------------------------ #
@@ -928,6 +940,8 @@ class RelicBotApp(tk.Tk):
             profile_frame, text="Update", command=self._run_updater,
         )
         _update_btn.grid(row=0, column=7, **pad)
+        # Held on self so the background release check can recolour it.
+        self._update_btn = _update_btn
         if _update_channel() == "nexus":
             _update_tip = (
                 "Install a RelicBot update you downloaded from NexusMods.\n"
@@ -3292,6 +3306,153 @@ class RelicBotApp(tk.Tk):
         # iterations so one bad OCR read can't end the run on its own.
         self._branch_out_of_murk              = False
         self._branch_low_murk_strikes         = 0
+        # Category tallies for the overlay's on-branch vs run-wide split.
+        # `_branch_on_path` counts only what survives into the save chain:
+        # a HIT/GOD ROLL makes its iteration the branch creator, and that
+        # iteration's save becomes the next branch's restore source, so
+        # everything it found is carried forward. Every other iteration is
+        # restored away, taking its smart hits / near misses / excluded hits
+        # with it. `_branch_found` is the run-wide total for the same
+        # categories, so both numbers come from one source in one place.
+        # Resolved off the CLASS, not `self`: test_branching.py drives
+        # _branch_reset_state from its own BranchHarness object, which is not a
+        # RelicBotApp and has no such attribute. Going through self coupled
+        # this method to the caller's type and broke that harness outright.
+        self._branch_on_path    = RelicBotApp._branch_empty_tally()
+        self._branch_found      = RelicBotApp._branch_empty_tally()
+        self._branch_iter_tally = RelicBotApp._branch_empty_tally()
+        # None until Phase 0 reads the counter for real — never seeded with a
+        # guess, so the overlay shows "—" rather than a number nobody measured.
+        self._branch_start_murk = None
+        self._run_start_murk    = None
+
+    @staticmethod
+    def _branch_empty_tally() -> dict:
+        """Zeroed category tally. One definition so the three users can't drift."""
+        return {"smart": 0, "near_miss": 0, "excl": 0, "relics": 0}
+
+    @staticmethod
+    def _branch_tally_results(relic_results: list) -> dict:
+        """Count this iteration's categories straight off `relic_results`.
+
+        Reads the `_category` each relic was stamped with when it was
+        classified, so this can never disagree with the categorisation the
+        run acted on. Deliberately NOT derived from the `_ov_*` overlay
+        counters: those are incremented from several call sites and are not
+        a per-iteration quantity.
+        """
+        tally = RelicBotApp._branch_empty_tally()
+        for _r in relic_results or []:
+            if not isinstance(_r, dict):
+                continue
+            tally["relics"] += 1
+            _cat = _r.get("_category")
+            if _cat in ("SMART", "SMART_GOD_ROLL"):
+                tally["smart"] += 1
+            elif _cat == "NEAR_MISS":
+                tally["near_miss"] += 1
+            elif _cat == "EXCLUDED":
+                tally["excl"] += 1
+        return tally
+
+    def _branch_trail_parts(self) -> tuple[str, str, str]:
+        """Header strings: (trail behind, current branch, depth/position).
+
+        The trail is derived from `_branch_current_index` on every call rather
+        than accumulated, so the 26-branch rename pass (A→AA, B→AB, …) is
+        picked up automatically instead of leaving a stale cached trail.
+        """
+        _idx = self._branch_current_index
+        _letters = [
+            self._branch_letter_for_index(
+                i, force_double=self._branch_double_letter_active)
+            for i in range(_idx + 1)
+        ]
+        _here = _letters[-1]
+        _behind = _letters[:-1]
+        # A deep run would otherwise push the batch counter out of the header.
+        # Only bites past 12 branches; the murk economics make that unlikely
+        # (5 splits consumed an entire 764k budget in the one real run).
+        if len(_behind) > 11:
+            _behind = _behind[:1] + ["…"] + _behind[-9:]
+        _trail = "".join(f"{p} › " for p in _behind)
+        _depth = f"{_idx} deep · iter {self._branch_position + 1} of branch"
+        return _trail, _here, _depth
+
+    def _branch_record_iter_tally(self, relic_results: list) -> None:
+        """Tally what this iteration found and add it to the run-wide totals.
+
+        Held in `_branch_iter_tally` rather than folded into `_branch_on_path`
+        straight away, because whether these relics survive is not known until
+        the branch-advance block decides if this iteration is the creator.
+        """
+        self._branch_iter_tally = self._branch_tally_results(relic_results)
+        for _tk, _tv in self._branch_iter_tally.items():
+            self._branch_found[_tk] = self._branch_found.get(_tk, 0) + _tv
+
+    def _branch_promote_iter_tally(self) -> None:
+        """Fold the held tally into the on-branch totals — creator iterations only.
+
+        LOAD-BEARING: call this ONLY from the `_branch_creator_pending` arm of
+        the branch-advance block. This iteration's save becomes the next
+        branch's restore source, which is the only way a smart hit, near miss
+        or excluded hit survives — none of them trigger a split on their own.
+        Every non-creator iteration is restored away and its tally is dropped
+        by never being promoted.
+        """
+        for _tk, _tv in self._branch_iter_tally.items():
+            self._branch_on_path[_tk] = self._branch_on_path.get(_tk, 0) + _tv
+
+    def _branch_record_murk_baseline(self, murk_val: int) -> None:
+        """Record the murk this branch's save restores with.
+
+        Called from the one place `_global_murk_expected` is established, which
+        is the first iteration of the run and the first iteration of each new
+        branch — the split clears the baseline precisely so it re-reads from
+        the new branch's save. Within a branch every iteration restores the
+        same file, so this value is constant until the next split.
+
+        The staircase only ever descends: a split permanently spends whatever
+        the creator iteration consumed, so `run start - branch start` is the
+        murk this run has committed and is what actually ends the run. The
+        iteration limit rarely does.
+        """
+        if not self._eff_branching():
+            return
+        self._branch_start_murk = murk_val
+        if self._run_start_murk is None:
+            self._run_start_murk = murk_val
+        self._push_branch_overlay()
+
+    def _push_branch_overlay(self) -> None:
+        """Send branch identity + the on-branch/run-wide split to the overlay.
+
+        LOAD-BEARING: gated on `_eff_branching()`, never the raw var, so a
+        ticked-but-inert Branching checkbox cannot relabel an Async run's
+        overlay.
+
+        While branching, this is the SOLE writer of the smart / near-miss /
+        excluded StringVars — the raw per-iteration pushes are suppressed for
+        the same reason (see their call sites). Two writers would race and the
+        formatted "N on branch" string would flicker back to a bare integer.
+        """
+        if not self._overlay or not self._eff_branching():
+            return
+        _trail, _here, _depth = self._branch_trail_parts()
+        _kw = {"branch_trail": _trail, "branch_here": _here, "branch_depth": _depth}
+        for _key, _var_kept, _var_found in (
+                ("smart",     "smart_hits",     "smart_found"),
+                ("near_miss", "near_miss_hits", "near_miss_found"),
+                ("excl",      "excl_hits",      "excl_found")):
+            _kw[_var_kept]  = f"{self._branch_on_path.get(_key, 0)} on branch"
+            _kw[_var_found] = f"({self._branch_found.get(_key, 0)} found)"
+        # Murk staircase. Rendered as "—" until Phase 0 has actually read the
+        # counter, rather than guessing a starting figure.
+        _rs, _bs = self._run_start_murk, self._branch_start_murk
+        _kw["run_start_murk"]    = f"{_rs:,}" if _rs is not None else "—"
+        _kw["branch_start_murk"] = f"{_bs:,}" if _bs is not None else "—"
+        ov = self._overlay
+        self.after(0, lambda _k=_kw: ov.update(**_k) if ov._win else None)
 
     def _branch_current_letter(self) -> str:
         """Convenience: current branch's letter, accounting for double-letter rename."""
@@ -3512,6 +3673,56 @@ class RelicBotApp(tk.Tk):
         })
         with _ur.urlopen(req, timeout=20) as resp:
             return _json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    # ── Silent start-up release check ───────────────────────────────────── #
+
+    def _start_update_check(self) -> None:
+        """Ask GitHub once, in the background, whether a newer release exists.
+
+        Non-intrusive by design: the ONLY outcome is the Update button turning
+        gold and its tooltip naming the new version. No popup, no dialog, no
+        log line the user has to dismiss, and nothing that can interrupt a run.
+
+        LOAD-BEARING: never runs on the `nexus` channel. That package must not
+        contact GitHub at all — the whole reason the two-package split exists —
+        and a silent check would be exactly the off-site call the compliance
+        rule forbids, made without the user asking. `_BUILD_IS_CE` is fine: it
+        reads its own versionless tag through the same helper.
+
+        Every failure is silent. Offline, rate-limited, DNS-blocked, garbage
+        tag: the button simply stays as it was. A start-up check that nags on
+        failure is worse than no check.
+        """
+        if _update_channel() == "nexus":
+            return
+        threading.Thread(target=self._update_check_worker,
+                         daemon=True, name="update-check").start()
+
+    def _update_check_worker(self) -> None:
+        """Background half of the start-up check. Never raises, never blocks."""
+        try:
+            meta = self._fetch_release_meta()
+            tag = str(meta.get("tag_name") or "")
+            remote = self._version_tuple(tag)
+            local = self._version_tuple(APP_VERSION)
+            # An unparseable remote tag means "cannot compare", never "newer" —
+            # the same rule _run_updater applies before offering a download.
+            if remote and local and remote > local:
+                self.after(0, lambda t=tag: self._mark_update_available(t))
+        except Exception:
+            pass   # silent by contract
+
+    def _mark_update_available(self, tag: str) -> None:
+        """Main-thread half: recolour the Update button and retitle its tip."""
+        try:
+            btn = getattr(self, "_update_btn", None)
+            if btn is None or not btn.winfo_exists():
+                return
+            btn.configure(style="UpdateAvailable.TButton")
+            self._log(f"A newer release is available ({tag}). "
+                      f"Click Update when you are ready — nothing happens until you do.")
+        except Exception:
+            pass
 
     def _run_updater(self, repair: bool = False, force: bool = False) -> None:
         """Entry point for the profile-row Update button.
@@ -5486,6 +5697,7 @@ class RelicBotApp(tk.Tk):
             self._overlay = BotOverlay(self)
             self._overlay.build(sw, sh, async_mode=self._eff_async(),
                                 backlog_mode=self._eff_backlog(),
+                                branching_mode=self._eff_branching(),
                                 settings=self._get_ov_settings())
             self._overlay.set_reset_iter_callback(self._request_reset_iter)
             self._overlay.set_stop_callback(self._request_stop_after_batch)
@@ -5501,6 +5713,9 @@ class RelicBotApp(tk.Tk):
                 best_33=_fmt_best(self._best_33_iter, "★★★"),
                 best_hits=_fmt_best(self._best_hits_iter, "hits"),
             )
+            # Seed the branch header so iteration 1 reads "# · 0 deep" rather
+            # than sitting blank until the first branch is created.
+            self._push_branch_overlay()
             self._overlay.start_game_watch(
                 getattr(self, "_overlay_exe_frag", "nightreign"))
         self._ready_event.set()
@@ -5796,6 +6011,9 @@ class RelicBotApp(tk.Tk):
         self.attempt_count     = 0
         self._stop_after_batch = False
         self._game_hung        = False
+        # Relic storage cap state — see the buy loop and the iteration wrap-up.
+        self._inventory_max_hit          = False
+        self._inventory_max_empty_streak = 0
         # Reset all counters — "All Time" tracks the current run only
         self._ov_hits_33     = 0
         self._ov_hits_23     = 0
@@ -7557,6 +7775,9 @@ class RelicBotApp(tk.Tk):
 
             # ── Normal mode: run phases + post-process inline ─────────── #
             self.after(0, self._show_mouse_blocker)
+            # Reset per iteration — the streak below counts CONSECUTIVE
+            # iterations, so a stale flag would end a healthy run.
+            self._inventory_max_hit = False
             relic_results = self._run_iteration_phases(
                 label, criteria, region,
                 iter_dir=iter_dir, hit_min=hit_min,
@@ -8026,7 +8247,10 @@ class RelicBotApp(tk.Tk):
             # Update excluded hits overlay counter
             if _excl_match_results:
                 self._ov_excl_hits += len(_excl_match_results)
-                if self._overlay:
+                # While branching, _push_branch_overlay owns this StringVar and
+                # writes it as "N on branch". Only the display is suppressed —
+                # the counter itself still feeds the run summary.
+                if self._overlay and not self._eff_branching():
                     _eh = self._ov_excl_hits
                     self.after(0, lambda _eh=_eh:
                                self._overlay.update(excl_hits=_eh)
@@ -8093,7 +8317,8 @@ class RelicBotApp(tk.Tk):
                 # Correct dud counters (near miss relics were counted as duds per-relic)
                 self._ov_duds    = max(0, self._ov_duds - len(_nm_results))
                 self._ov_at_duds = max(0, self._ov_at_duds - len(_nm_results))
-                if self._overlay:
+                # See the excluded-hits note above — same single-writer rule.
+                if self._overlay and not self._eff_branching():
                     _nmh = self._ov_near_miss_hits
                     self.after(0, lambda _nmh=_nmh:
                                self._overlay.update(near_miss_hits=_nmh)
@@ -8103,9 +8328,43 @@ class RelicBotApp(tk.Tk):
             if num_matched >= 1 or _excl_match_results:
                 self._good_iterations.add(iteration)
 
+            # Branching Mode: tally what THIS iteration found, before the
+            # branch state advances below. Counted off `relic_results` via the
+            # `_category` each relic was stamped with at classification time,
+            # so it cannot disagree with what the run acted on. Held aside
+            # rather than folded in immediately: whether these relics survive
+            # depends on this iteration becoming the branch creator, which is
+            # decided in the block directly below.
+            if self._eff_branching():
+                self._branch_record_iter_tally(relic_results)
+
             # Deferred save copy — set AFTER any rename so the path is always valid
             _prev_save_dir = iter_dir
             _diag_end("ok")
+
+            # Relic storage cap: a normal iteration-ender, EXCEPT when it
+            # yields nothing. Murk exhaustion is safe to repeat because the
+            # save restore brings murk back — but the restore brings the
+            # INVENTORY back too, so a save sitting exactly at the cap buys
+            # zero relics every iteration and the run spins for its whole
+            # limit reporting successes. Two consecutive empty ones is
+            # unambiguous: the user has to free space before anything can
+            # happen. Stop and say so rather than burn the night.
+            if getattr(self, "_inventory_max_hit", False):
+                if not relic_results:
+                    self._inventory_max_empty_streak = getattr(
+                        self, "_inventory_max_empty_streak", 0) + 1
+                else:
+                    self._inventory_max_empty_streak = 0
+                if self._inventory_max_empty_streak >= 2:
+                    self._log(
+                        "Relic storage is full and the restored save cannot hold "
+                        "any more — two iterations in a row bought nothing. "
+                        "Stopping the run. Free up relic space in-game, then "
+                        "make a fresh backup and start again.")
+                    self.bot_running = False
+            else:
+                self._inventory_max_empty_streak = 0
 
             # Branching Mode: advance state for the NEXT iteration. The Phase 5
             # rename block earlier in this iter's wrap-up already used the OLD
@@ -8145,6 +8404,7 @@ class RelicBotApp(tk.Tk):
                     self._branch_current_reset_path = os.path.join(
                         iter_dir, save_filename)
                     self._branch_creator_pending = False
+                    self._branch_promote_iter_tally()
                     # The new branch's save holds LESS murk than the previous
                     # one — this iteration spent some buying the relics that
                     # produced the match. Phase 0's anti-drift guard compares
@@ -8172,6 +8432,10 @@ class RelicBotApp(tk.Tk):
                             pass
                 else:
                     self._branch_position += 1
+                # Refresh after the state advance either way, so the trail
+                # grows the moment a branch is created and the in-branch
+                # iteration counter ticks on every other iteration.
+                self._push_branch_overlay()
 
             results.append({
                 "iteration": iteration,
@@ -10036,6 +10300,39 @@ class RelicBotApp(tk.Tk):
     #  PHASE EXECUTION ENGINE
     # ------------------------------------------------------------------ #
 
+    def _qty_from_required_murk(self, qty_cost, expected, murk_cost=None):
+        """Derive the buy quantity from the dialog's Required Murk.
+
+        Used when the X/N OCR returns nothing on a dialog that is plainly open
+        and readable — a documented failure mode: `buy_qty_fallback_murk` fired
+        49 times in a single run, and a field dump showed a legible "2/ 2" read
+        back as None at confidence 0.000 while the cost region parsed 3,600
+        correctly.
+
+        LOAD-BEARING — divides by the relic-type cost FIRST. The learned
+        `_per_relic_murk_cost` is computed as `cycle_cost // batch_size`, so it
+        inherits any error in the very quantity this exists to replace. That is
+        the same divisor trap the buy-count reconciliation was explicitly fixed
+        for; the learned value is kept only as a second chance for the case
+        where the relic-type cost is unavailable.
+
+        Returns None rather than a guess: the caller must only ever accept a
+        derived count that AGREES with what it already expected.
+        """
+        if not qty_cost or not expected or expected <= 0:
+            return None
+        # `self.__dict__.get`, not `getattr`: this class subclasses tk.Tk, whose
+        # __getattr__ forwards unknown names to self.tk. On an instance built
+        # with __new__ (how every harness here drives these methods) that
+        # recurses until RecursionError — and the getattr default never applies,
+        # because the failure is not AttributeError.
+        _learned = self.__dict__.get("_per_relic_murk_cost")
+        for _cost in (murk_cost, _learned):
+            if _cost and _cost > 0 and qty_cost % _cost == 0:
+                if qty_cost // _cost == expected:
+                    return expected
+        return None
+
     def _run_iteration_phases(self, label: str, criteria: dict,
                               region,
                               iter_dir: str = "", hit_min: int = 2,
@@ -10330,6 +10627,10 @@ class RelicBotApp(tk.Tk):
                         # save the current branch actually restores from.
                         if self._global_murk_expected is None:
                             self._global_murk_expected = murk_val
+                            # Same moment, by construction: the baseline is
+                            # None exactly on the first iteration of the run
+                            # and on the first iteration of every new branch.
+                            self._branch_record_murk_baseline(murk_val)
                         elif murk_val != self._global_murk_expected:
                             # One retry to rule out OCR noise before aborting.
                             self._log(
@@ -10494,6 +10795,14 @@ class RelicBotApp(tk.Tk):
                     }
 
             _buy_loop_done = False   # set True when "Insufficient murk" detected mid-cycle
+            # Murk total as of the end of the last completed cycle.  The buy-count
+            # reconciliation already reads this after every cycle (_mk_after);
+            # carrying it forward is what lets a mid-iteration recovery prove
+            # nothing was bought while the bot was lost.  Seeded from the Phase 0
+            # read because _mk_after is not bound until the first reconciliation
+            # runs, and a cycle-1 failure reaches the recovery before that —
+            # iteration 24 of batch_run_2026-08-10_120047 did exactly that.
+            _murk_expected_now = self._global_murk_expected or 0
             for _batch_i in range(_buy_count):
                 if _buy_loop_done:
                     break
@@ -10650,6 +10959,69 @@ class RelicBotApp(tk.Tk):
 
                         _qty_jpeg, _qty_x, _qty_n, _qty_conf, _qty_cost = _ocr_buy_dialog()
 
+                        # ── Relic storage cap: a SOFT stop, not a failure ──── #
+                        # The game refuses the purchase with
+                        #   "Cannot purchase due to inventory maximum"
+                        # and the buy dialog never opens, so X/N is unreadable.
+                        #
+                        # Treated exactly like running out of murk: stop buying,
+                        # keep everything already bought, and end the iteration
+                        # SUCCESSFULLY. The user is not out of stock and nothing
+                        # is broken — they simply cannot hold more relics.
+                        #
+                        # LOAD-BEARING: checked HERE, on the FIRST failed read,
+                        # before the Q-retries and before the ESC + Phase 0
+                        # replay. That replay ends in `_do_buy_open_and_select()`
+                        # pressing E blind with nothing verifying where the
+                        # cursor is — pointless against a modal that will just
+                        # reappear, and the same "keys into an unknown screen"
+                        # shape as the Signboard drift.
+                        #
+                        # Only runs when the read already failed, so the happy
+                        # path pays nothing for it.
+                        if _qty_x is None and _qty_jpeg:
+                            _inv_full, _inv_conf = relic_analyzer.is_inventory_full(
+                                _qty_jpeg)
+                            if _inv_full:
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: relic storage is full"
+                                    f" (\"Cannot purchase due to inventory maximum\","
+                                    f" conf {_inv_conf:.2f}) — ending iteration here."
+                                    f" Everything bought so far is kept.")
+                                if self._diag:
+                                    try:
+                                        self._diag.log_buy_qty(
+                                            event="inventory_max",
+                                            cycle=_batch_i + 1,
+                                            expected=_batch_size,
+                                            conf=_inv_conf)
+                                        self._diag.phase_end(
+                                            f"Cycle {_batch_i + 1} Phase 1 (buy)",
+                                            note="inventory maximum")
+                                    except Exception:
+                                        pass
+                                # Keep the frame: this is the first detector in
+                                # the project built from a single real sample, so
+                                # every field sighting is worth having.
+                                try:
+                                    relic_analyzer.dump_buyqty_fail(
+                                        image_bytes=_qty_jpeg,
+                                        cycle=_batch_i + 1, attempt=_p1_try,
+                                        event="inventory_max",
+                                        x_read=_qty_x, n_read=_qty_n,
+                                        cost_read=_qty_cost, conf=_inv_conf,
+                                        note=f"batch_size={_batch_size}")
+                                except Exception:
+                                    pass
+                                # Dismiss the box so the game is left clean.
+                                _q_back_with_verify(_qty_jpeg)
+                                self._inventory_max_hit = True
+                                _p1_ok = True          # not the abort path
+                                _buy_loop_done = True  # stop the outer cycle loop
+                                if _exclude_buy_phase:
+                                    self._set_ocr_throttle(False)
+                                break   # break _p1_try loop
+
                         # Decide outcome
                         _accepted = False
                         _via_fallback = False
@@ -10666,28 +11038,26 @@ class RelicBotApp(tk.Tk):
                             _accepted = True
                             _actual_batch_size = _qty_x
                         elif _qty_x is None:
-                            # Fallback: derive X from required-murk (needs known cost)
-                            _per_cost = getattr(self, "_per_relic_murk_cost", None)
-                            if (_qty_cost is not None and _per_cost
-                                    and _per_cost > 0
-                                    and _qty_cost % _per_cost == 0):
-                                _x_from_cost = _qty_cost // _per_cost
-                                if _x_from_cost == _batch_size:
-                                    _accepted = True
-                                    _via_fallback = True
-                                    _actual_batch_size = _x_from_cost
-                                    if self._diag:
-                                        try:
-                                            self._diag.log_buy_qty(
-                                                event="fallback_murk",
-                                                cycle=_batch_i + 1,
-                                                expected=_batch_size,
-                                                got=_x_from_cost,
-                                                n_cap=_batch_size,
-                                                cost=_qty_cost,
-                                                attempt=_qty_attempt + 1)
-                                        except Exception:
-                                            pass
+                            # Fallback: derive X from required-murk. Shared with
+                            # the post-ESC retry below so the two cannot drift.
+                            _x_from_cost = self._qty_from_required_murk(
+                                _qty_cost, _batch_size, murk_cost)
+                            if _x_from_cost is not None:
+                                _accepted = True
+                                _via_fallback = True
+                                _actual_batch_size = _x_from_cost
+                                if self._diag:
+                                    try:
+                                        self._diag.log_buy_qty(
+                                            event="fallback_murk",
+                                            cycle=_batch_i + 1,
+                                            expected=_batch_size,
+                                            got=_x_from_cost,
+                                            n_cap=_batch_size,
+                                            cost=_qty_cost,
+                                            attempt=_qty_attempt + 1)
+                                    except Exception:
+                                        pass
                             if not _accepted and self._diag:
                                 try:
                                     self._diag.log_buy_qty(
@@ -10782,18 +11152,178 @@ class RelicBotApp(tk.Tk):
                             break
 
                     if not _qty_ok:
-                        # Q retries exhausted → ESC reset + Phase 0 replay + one final retry
-                        self._log(
-                            f"  Cycle {_batch_i + 1}: Q retries exhausted —"
-                            f" ESC reset + Phase 0 + retry")
-                        self._esc_to_game_screen(region)
-                        if self.phase_events[0]:
-                            self.player.play(
-                                self.phase_events[0],
-                                extra_delay=_p02_extra_delay)
-                            # Brief settle before re-attempting buy
-                            time.sleep((3.0 if _lpm else 1.5)
-                                       * max(1.0, self._perf_gap_mult))
+                        # Q retries exhausted → soft reset.  NOTHING has been
+                        # bought on this cycle: the confirm F only fires after a
+                        # clean quantity read, so resetting here cannot cost a
+                        # relic.  Checked against batch_run_2026-08-10_120047 —
+                        # all six occurrences had cycles-completed exactly equal
+                        # to the ledger row count.
+                        #
+                        # LOAD-BEARING: never buy after a Phase 0 replay without
+                        # confirming we arrived.  This path used to replay, sleep
+                        # a fixed 1.5-3 s and press E blind; when the replay did
+                        # not land, the dialog was never on screen, X/N/cost all
+                        # read None, and that was reported as "shop likely empty"
+                        # with ~290 relics of stock left.  The sibling recovery
+                        # ("relic screen not found", below) has always polled for
+                        # the shop before retrying — this one never did.
+                        _SOFT_RESET_MAX     = 2
+                        _reset_ok           = False
+                        _reset_why          = "not attempted"
+                        _depleted_confirmed = False
+                        _mv                 = 0
+                        for _sr in range(_SOFT_RESET_MAX):
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: Q retries exhausted —"
+                                f" soft reset {_sr + 1}/{_SOFT_RESET_MAX}"
+                                f" (ESC + Phase 0)")
+                            self._esc_to_game_screen(region)
+                            if self.phase_events[0]:
+                                self.player.play(
+                                    self.phase_events[0],
+                                    extra_delay=_p02_extra_delay)
+                                # Brief settle before re-attempting buy
+                                time.sleep((3.0 if _lpm else 1.5)
+                                           * max(1.0, self._perf_gap_mult))
+                            if not self.bot_running or self._reset_iter_requested:
+                                self._set_ocr_throttle(False)
+                                if (not self.bot_running and capture_only
+                                        and not _p2_async):
+                                    return _bl_captures
+                                return relic_results
+
+                            # ── 1. back on the shop screen at all? ──────────── #
+                            # Same predicate and same 4 s budget as the sibling
+                            # recovery path.
+                            _shop_back_q = False
+                            for _sw in range(20):
+                                if (not self.bot_running
+                                        or self._reset_iter_requested):
+                                    self._set_ocr_throttle(False)
+                                    if (not self.bot_running and capture_only
+                                            and not _p2_async):
+                                        return _bl_captures
+                                    return relic_results
+                                try:
+                                    _sw_img = screen_capture.capture(region)
+                                    if relic_analyzer.check_text_visible(
+                                            _sw_img, "small jar bazaar",
+                                            top_fraction=0.15):
+                                        _shop_back_q = True
+                                        break
+                                except Exception:
+                                    pass
+                                time.sleep(0.20)
+                            if not _shop_back_q:
+                                _reset_why = "shop screen not re-detected"
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}")
+                                continue
+
+                            # ── 2. sitting on the RIGHT item? ───────────────── #
+                            # verify_shop_item checks the tooltip name, the
+                            # Deep/normal token position, and the '1.02'
+                            # old-version marker in the description.  Buying off
+                            # the wrong item is how a false positive would reach
+                            # the results.
+                            try:
+                                _iv_img = screen_capture.capture(region)
+                                _item_ok, _item_why = (
+                                    relic_analyzer.verify_shop_item(
+                                        _iv_img, self.relic_type_var.get()))
+                            except Exception as _ive:
+                                _item_ok = False
+                                _item_why = f"verify error: {_ive}"
+                            if not _item_ok:
+                                _reset_why = f"wrong shop item ({_item_why})"
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}")
+                                continue
+
+                            # ── 3. is the murk total where we left it? ──────── #
+                            # _murk_expected_now is the post-buy total the
+                            # reconciliation already reads at the end of every
+                            # cycle.  If it moved while the bot was lost then
+                            # something was bought that we never asked for, and
+                            # buying on top of that would compound it.
+                            try:
+                                _mv_img = screen_capture.capture(region)
+                                _mv, _ = relic_analyzer.read_murk(
+                                    _mv_img, region=self._murk_region)
+                            except Exception as _mve:
+                                _mv = 0
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: murk re-check"
+                                    f" error: {_mve}")
+                            if not _mv or _mv <= 0:
+                                _reset_why = "murk unreadable on the shop screen"
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}")
+                                continue
+                            if _murk_expected_now and _mv != _murk_expected_now:
+                                _reset_why = (
+                                    f"murk moved while recovering"
+                                    f" ({_murk_expected_now:,} → {_mv:,},"
+                                    f" {_murk_expected_now - _mv:,} spent)")
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: {_reset_why}"
+                                    f" — something was bought that we did not"
+                                    f" ask for; not buying again")
+                                break
+                            if _mv < murk_cost:
+                                # Genuinely out of murk.  This is the ONLY test
+                                # allowed to conclude end-of-stock — measured,
+                                # never inferred from an empty OCR read.
+                                _depleted_confirmed = True
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: shop re-verified"
+                                f" — murk {_mv:,}")
+                            _reset_ok = True
+                            break
+
+                        if _depleted_confirmed:
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: murk exhausted"
+                                f" ({_mv:,} < {murk_cost:,}) after {_batch_i}"
+                                f" cycle(s) — ending iteration")
+                            if self._diag:
+                                try:
+                                    self._diag.log_buy_qty(
+                                        event="shop_depleted",
+                                        cycle=_batch_i + 1,
+                                        expected=_batch_size,
+                                        got=0, n_cap=0, conf=0.0, cost=0)
+                                except Exception:
+                                    pass
+                            if _exclude_buy_phase:
+                                self._set_ocr_throttle(False)
+                            _p1_ok = True
+                            _buy_loop_done = True
+                            break   # break _p1_try loop
+
+                        if not _reset_ok:
+                            # Recovery failed.  Do NOT press E into whatever is
+                            # on screen — pressing keys while lost is how the bot
+                            # ends up interacting with the wrong thing.  Abort
+                            # the iteration and say why.
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: could not get back to"
+                                f" the shop after {_SOFT_RESET_MAX} soft"
+                                f" reset(s) — {_reset_why} — aborting iteration")
+                            if self._diag:
+                                try:
+                                    self._diag.log_buy_qty(
+                                        event="unrecoverable",
+                                        cycle=_batch_i + 1,
+                                        expected=_batch_size,
+                                        got=0, n_cap=0, conf=0.0, cost=0)
+                                except Exception:
+                                    pass
+                            self._set_ocr_throttle(False)
+                            if _p2_async:
+                                self._async_iter_abort_cleanup(
+                                    iteration, _p2_submitted)
+                            return relic_results
 
                         _do_buy_open_and_select()
                         if not self.bot_running or self._reset_iter_requested:
@@ -10826,28 +11356,63 @@ class RelicBotApp(tk.Tk):
                                 except Exception:
                                     pass
                             _qty_ok = True
+                        elif self._qty_from_required_murk(
+                                _qty_cost, _batch_size, murk_cost) is not None:
+                            # SAME fallback the first read gets. It was missing
+                            # here, and that omission is what ended both aborted
+                            # iterations of batch_run_2026-08-13_010953: the
+                            # dialog was open and legibly showing "2/ 2", the
+                            # cost region parsed 3,600 with batch_size 2, and
+                            # 3600 // 1800 == 2 would have accepted it — but
+                            # this path required a non-None X and fell through
+                            # to "unrecoverable" instead.
+                            #
+                            # The recurring shape: a fix landed on one call path
+                            # and not its sibling. `buy_qty_fallback_murk` fired
+                            # 49 times in one run on the path that had it.
+                            with relic_analyzer.input_gpu_yield():
+                                self.player.tap("f", hold=_p1_hold)
+                            _actual_batch_size = _batch_size
+                            if self._diag:
+                                try:
+                                    self._diag.log_buy_qty(
+                                        event="fallback_murk",
+                                        cycle=_batch_i + 1,
+                                        expected=_batch_size,
+                                        got=_actual_batch_size,
+                                        n_cap=_batch_size,
+                                        conf=_qty_conf,
+                                        cost=_qty_cost or 0,
+                                        note="post-ESC retry")
+                                except Exception:
+                                    pass
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: X/N unreadable after ESC"
+                                f" reset, but required murk ({_qty_cost:,}) matches"
+                                f" {_batch_size} relic(s) — proceeding.")
+                            _qty_ok = True
                         else:
-                            # Distinguish shop-depleted (expected, graceful
-                            # end of iteration when stock runs out) from
-                            # genuine unrecoverable (dialog opened but OCR
-                            # read garbage — real bug or game bug).
-                            _shop_depleted = (
-                                (_qty_x is None or _qty_x == 0)
-                                and (_qty_n is None or _qty_n == 0)
-                                and (not _qty_cost)
-                            )
-                            if _shop_depleted:
-                                self._log(
-                                    f"  Cycle {_batch_i + 1}: shop likely"
-                                    f" empty ({_batch_i} cycles completed)"
-                                    f" — ending iteration gracefully")
-                                _event = "shop_depleted"
-                            else:
-                                self._log(
-                                    f"  Cycle {_batch_i + 1}: ESC reset retry"
-                                    f" also failed (got {_qty_x}/{_qty_n})"
-                                    f" — aborting iteration")
-                                _event = "unrecoverable"
+                            # Getting here means the shop screen AND the shop
+                            # item were verified moments ago and the murk total
+                            # was exactly where we left it, so an unreadable buy
+                            # dialog is a genuine failure.  Depletion is decided
+                            # from the murk total alone, in the soft-reset block
+                            # above.
+                            #
+                            # LOAD-BEARING: do NOT reinstate the old rule that
+                            # x/n/cost all reading None means "shop likely
+                            # empty".  An all-None read is the signature of the
+                            # dialog not being on screen at all — the murk crop
+                            # in those dumps is a stone wall.  That rule ended 6
+                            # iterations of batch_run_2026-08-10_120047 between
+                            # cycle 1 and cycle 11 of 31, each with ~290 relics
+                            # of stock still on the shelf, and logged every one
+                            # of them as a graceful success.
+                            self._log(
+                                f"  Cycle {_batch_i + 1}: ESC reset retry"
+                                f" also failed (got {_qty_x}/{_qty_n})"
+                                f" — aborting iteration")
+                            _event = "unrecoverable"
                             if self._diag:
                                 try:
                                     self._diag.log_buy_qty(
@@ -11339,6 +11904,20 @@ class RelicBotApp(tk.Tk):
                     # it must never be the divisor when the real cost is known.
                     _per_cost = murk_cost or getattr(
                         self, "_per_relic_murk_cost", None)
+                    # Hoisted out of the branch below so every path can read
+                    # them: a cycle that skips reconciliation (no settle frame)
+                    # would otherwise leave these unbound — the v1.8.10
+                    # unbindable-name class.
+                    _mk_before = _mk_after = 0
+                    _mk_delta = 0
+                    # Invalidate the carried murk expectation up front.  It is
+                    # only trustworthy when the reconciliation below actually
+                    # runs; a cycle that skips it still spends murk, so a stale
+                    # value would make the NEXT cycle's soft reset report
+                    # "murk moved while recovering" and abort a perfectly
+                    # recoverable iteration.  0 means "unknown", and the
+                    # soft-reset check skips rather than guesses.
+                    _murk_expected_now = 0
                     if (_per_cost and _per_cost > 0
                             and _qty_jpeg is not None
                             and _settle_img is not None):
@@ -11351,6 +11930,15 @@ class RelicBotApp(tk.Tk):
                         except Exception:
                             pass
                         _mk_delta = (_mk_before or 0) - (_mk_after or 0)
+                        # Carry the true post-buy total forward for the
+                        # soft-reset murk check.  Guarded on a real read so a
+                        # failed OCR cannot poison the expectation with 0.
+                        # Kept here, at the point the value is actually measured,
+                        # rather than anywhere further down the cycle — the
+                        # soft-reset check is worthless if the expectation is
+                        # set on some paths and not others.
+                        if _mk_after:
+                            _murk_expected_now = _mk_after
                         _mk_bought = None
                         if _mk_delta > 0 and _mk_delta % _per_cost == 0:
                             _mk_bought = _mk_delta // _per_cost
@@ -13973,6 +14561,7 @@ class RelicBotApp(tk.Tk):
                 ("Phase 1 buy-qty verify", [
                     "buy_qty_verified", "buy_qty_corrected_q",
                     "buy_qty_corrected_esc", "buy_qty_shop_depleted",
+                    "buy_qty_inventory_max",
                     "buy_qty_unrecoverable", "buy_qty_ocr_fail",
                     "buy_qty_drift_detected", "buy_qty_fallback_murk"]),
                 ("Phase 2 advance", [
