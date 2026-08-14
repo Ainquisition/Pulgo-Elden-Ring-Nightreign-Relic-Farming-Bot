@@ -22,6 +22,8 @@ START_BG     = "#28632a"   # ▶ START button
 START_HOVER  = "#349136"
 STOP_BG      = "#7a2020"   # ■ STOP button
 STOP_HOVER   = "#9e2a2a"
+UPDATE_BG    = "#35618e"   # Update button once a newer release is available
+UPDATE_HOVER = "#43769f"
 
 
 def apply(root):
@@ -113,6 +115,20 @@ def apply(root):
                 padding=(10, 5))
     s.map("Stop.TButton",
           background=[("active", STOP_HOVER), ("disabled", SURFACE2)],
+          foreground=[("disabled", TEXT_MUTED)])
+
+    # Update button once a newer release has been seen. A muted blue: it must
+    # read as information, not as a warning. Deliberately NOT the gold accent
+    # (which is used for section headers and selections all over the UI, so it
+    # shouts) and deliberately not the STOP red — a new version is good news,
+    # not a fault. This recolour is the ONLY signal: no popup, no dialog,
+    # nothing that interrupts a run.
+    s.configure("UpdateAvailable.TButton",
+                background=UPDATE_BG,
+                foreground="#ffffff",
+                padding=(6, 3))
+    s.map("UpdateAvailable.TButton",
+          background=[("active", UPDATE_HOVER), ("disabled", SURFACE)],
           foreground=[("disabled", TEXT_MUTED)])
 
     # ── Scrollbar ─────────────────────────────────────────────────────── #
