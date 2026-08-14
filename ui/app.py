@@ -5796,6 +5796,9 @@ class RelicBotApp(tk.Tk):
         self.attempt_count     = 0
         self._stop_after_batch = False
         self._game_hung        = False
+        # Relic storage cap state — see the buy loop and the iteration wrap-up.
+        self._inventory_max_hit          = False
+        self._inventory_max_empty_streak = 0
         # Reset all counters — "All Time" tracks the current run only
         self._ov_hits_33     = 0
         self._ov_hits_23     = 0
@@ -7557,6 +7560,9 @@ class RelicBotApp(tk.Tk):
 
             # ── Normal mode: run phases + post-process inline ─────────── #
             self.after(0, self._show_mouse_blocker)
+            # Reset per iteration — the streak below counts CONSECUTIVE
+            # iterations, so a stale flag would end a healthy run.
+            self._inventory_max_hit = False
             relic_results = self._run_iteration_phases(
                 label, criteria, region,
                 iter_dir=iter_dir, hit_min=hit_min,
@@ -8106,6 +8112,30 @@ class RelicBotApp(tk.Tk):
             # Deferred save copy — set AFTER any rename so the path is always valid
             _prev_save_dir = iter_dir
             _diag_end("ok")
+
+            # Relic storage cap: a normal iteration-ender, EXCEPT when it
+            # yields nothing. Murk exhaustion is safe to repeat because the
+            # save restore brings murk back — but the restore brings the
+            # INVENTORY back too, so a save sitting exactly at the cap buys
+            # zero relics every iteration and the run spins for its whole
+            # limit reporting successes. Two consecutive empty ones is
+            # unambiguous: the user has to free space before anything can
+            # happen. Stop and say so rather than burn the night.
+            if getattr(self, "_inventory_max_hit", False):
+                if not relic_results:
+                    self._inventory_max_empty_streak = getattr(
+                        self, "_inventory_max_empty_streak", 0) + 1
+                else:
+                    self._inventory_max_empty_streak = 0
+                if self._inventory_max_empty_streak >= 2:
+                    self._log(
+                        "Relic storage is full and the restored save cannot hold "
+                        "any more — two iterations in a row bought nothing. "
+                        "Stopping the run. Free up relic space in-game, then "
+                        "make a fresh backup and start again.")
+                    self.bot_running = False
+            else:
+                self._inventory_max_empty_streak = 0
 
             # Branching Mode: advance state for the NEXT iteration. The Phase 5
             # rename block earlier in this iter's wrap-up already used the OLD
@@ -10649,6 +10679,69 @@ class RelicBotApp(tk.Tk):
                             return relic_results
 
                         _qty_jpeg, _qty_x, _qty_n, _qty_conf, _qty_cost = _ocr_buy_dialog()
+
+                        # ── Relic storage cap: a SOFT stop, not a failure ──── #
+                        # The game refuses the purchase with
+                        #   "Cannot purchase due to inventory maximum"
+                        # and the buy dialog never opens, so X/N is unreadable.
+                        #
+                        # Treated exactly like running out of murk: stop buying,
+                        # keep everything already bought, and end the iteration
+                        # SUCCESSFULLY. The user is not out of stock and nothing
+                        # is broken — they simply cannot hold more relics.
+                        #
+                        # LOAD-BEARING: checked HERE, on the FIRST failed read,
+                        # before the Q-retries and before the ESC + Phase 0
+                        # replay. That replay ends in `_do_buy_open_and_select()`
+                        # pressing E blind with nothing verifying where the
+                        # cursor is — pointless against a modal that will just
+                        # reappear, and the same "keys into an unknown screen"
+                        # shape as the Signboard drift.
+                        #
+                        # Only runs when the read already failed, so the happy
+                        # path pays nothing for it.
+                        if _qty_x is None and _qty_jpeg:
+                            _inv_full, _inv_conf = relic_analyzer.is_inventory_full(
+                                _qty_jpeg)
+                            if _inv_full:
+                                self._log(
+                                    f"  Cycle {_batch_i + 1}: relic storage is full"
+                                    f" (\"Cannot purchase due to inventory maximum\","
+                                    f" conf {_inv_conf:.2f}) — ending iteration here."
+                                    f" Everything bought so far is kept.")
+                                if self._diag:
+                                    try:
+                                        self._diag.log_buy_qty(
+                                            event="inventory_max",
+                                            cycle=_batch_i + 1,
+                                            expected=_batch_size,
+                                            conf=_inv_conf)
+                                        self._diag.phase_end(
+                                            f"Cycle {_batch_i + 1} Phase 1 (buy)",
+                                            note="inventory maximum")
+                                    except Exception:
+                                        pass
+                                # Keep the frame: this is the first detector in
+                                # the project built from a single real sample, so
+                                # every field sighting is worth having.
+                                try:
+                                    relic_analyzer.dump_buyqty_fail(
+                                        image_bytes=_qty_jpeg,
+                                        cycle=_batch_i + 1, attempt=_p1_try,
+                                        event="inventory_max",
+                                        x_read=_qty_x, n_read=_qty_n,
+                                        cost_read=_qty_cost, conf=_inv_conf,
+                                        note=f"batch_size={_batch_size}")
+                                except Exception:
+                                    pass
+                                # Dismiss the box so the game is left clean.
+                                _q_back_with_verify(_qty_jpeg)
+                                self._inventory_max_hit = True
+                                _p1_ok = True          # not the abort path
+                                _buy_loop_done = True  # stop the outer cycle loop
+                                if _exclude_buy_phase:
+                                    self._set_ocr_throttle(False)
+                                break   # break _p1_try loop
 
                         # Decide outcome
                         _accepted = False
@@ -13973,6 +14066,7 @@ class RelicBotApp(tk.Tk):
                 ("Phase 1 buy-qty verify", [
                     "buy_qty_verified", "buy_qty_corrected_q",
                     "buy_qty_corrected_esc", "buy_qty_shop_depleted",
+                    "buy_qty_inventory_max",
                     "buy_qty_unrecoverable", "buy_qty_ocr_fail",
                     "buy_qty_drift_detected", "buy_qty_fallback_murk"]),
                 ("Phase 2 advance", [

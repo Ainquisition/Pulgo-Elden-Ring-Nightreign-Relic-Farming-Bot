@@ -1803,6 +1803,56 @@ def is_dismissible_dialog(image_bytes: bytes) -> tuple:
     return best > 0.0, best
 
 
+# "Cannot purchase due to inventory maximum" — the relic storage cap.
+# Band and tokens were MEASURED on a real 2560x1440 capture of the box
+# rather than guessed from where the text looks like it sits:
+#   band 0.40-0.60  ->  'lcannot' 0.05  'purchase due' 0.80  'inventory Maximum' 0.63
+#   band 0.35-0.70  ->  'Cannot purchase due' 0.98        'inventory maximum' 0.67
+# The tighter band breaks the first word outright, so the wider one is used.
+_INVMAX_BAND_FROM = 0.35
+_INVMAX_BAND_TO   = 0.70
+_INVMAX_MIN_CONF  = 0.40
+_INVMAX_WORDS     = ("inventory", "maximum")
+
+
+def is_inventory_full(image_bytes: bytes) -> tuple:
+    """Is the "Cannot purchase due to inventory maximum" box on screen?
+
+    Returns (bool, confidence).
+
+    LOAD-BEARING — match on "inventory" AND "maximum", never on "purchase".
+    The word "purchase" appears in the item tooltip on the very same screen
+    ("Purchase to reveal its precious gift"), so a predicate keyed on it would
+    fire on an ordinary shop frame with no dialog at all. Both required words
+    are absent from every other string on that screen.
+
+    Deliberately NOT keyed on the OK button either: `is_dismissible_dialog`
+    returns True (0.84) on this frame, but it also returns True for the
+    title-screen modals, so it cannot name WHICH dialog is up.
+
+    NEVER RAISES — same contract as `is_dismissible_dialog`. This is consulted
+    inside the buy-retry chain, and a detector that throws there would turn a
+    clean end-of-iteration into an aborted one.
+    """
+    try:
+        toks = scan_text_tokens(image_bytes, top_fraction=_INVMAX_BAND_TO,
+                                from_fraction=_INVMAX_BAND_FROM)
+    except Exception:
+        return False, 0.0
+    seen = {w: 0.0 for w in _INVMAX_WORDS}
+    for t, c in toks:
+        if c < _INVMAX_MIN_CONF:
+            continue
+        norm = " ".join(
+            "".join(ch for ch in str(t).lower() if ch.isalnum() or ch.isspace()).split())
+        for w in _INVMAX_WORDS:
+            if w in norm and c > seen[w]:
+                seen[w] = c
+    if all(seen[w] > 0.0 for w in _INVMAX_WORDS):
+        return True, min(seen.values())
+    return False, 0.0
+
+
 def verify_shop_item(image_bytes: bytes, relic_type: str) -> tuple:
     """
     Confirm the highlighted shop item is the correct relic before Phase 1 runs.
