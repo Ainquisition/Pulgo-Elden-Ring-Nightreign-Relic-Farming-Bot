@@ -1658,6 +1658,59 @@ class _PassivePoolTab(ttk.Frame):
     def _on_threshold_change(self):
         self._update_odds()
 
+    @staticmethod
+    def _pool_group_probability(compute, entries, pool_passives, colors_norm, threshold):
+        """P(a relic satisfies the POOL group) — the threshold, entries only.
+
+        LOAD-BEARING: the pool threshold applies to pool ENTRIES and nothing
+        else. Pairings are standalone doors and must never be folded in here;
+        doing so is what once produced a total rarer than its own most likely
+        component.
+
+        Shared by the pool tab and the combined view. They previously computed
+        their group figures separately, and the pool tab simply never computed
+        this one at all — which is how a configured "3 of 5" pool disappeared
+        from the panel the moment a pairing was added, leaving only the
+        per-passive lines, which describe single passives rather than a match.
+
+        Uses the enhanced (category-elimination) probability only, matching the
+        combined view's shipped behaviour: an entry the enhanced engine cannot
+        price is dropped rather than substituted with the simpler estimate.
+        """
+        probs = []
+        for entry in entries or []:
+            doors = [(frozenset([p]), "entry", colors_norm)
+                     for p in entry.get("accepted", []) if p in pool_passives]
+            if not doors or not compute:
+                continue
+            _p_m, p_c = compute(doors)
+            if p_c and p_c > 0:
+                probs.append(p_c)
+        if not probs or len(probs) < threshold:
+            return None
+        p_pool = prob_at_least_k_of_pool(probs, threshold)
+        return p_pool if p_pool and p_pool > 0 else None
+
+    @staticmethod
+    def _pairings_group_probability(compute, pairings, pool_passives):
+        """P(a relic satisfies ANY pairing) — a union, never a threshold.
+
+        `_doors_from_pairings` emits one STANDALONE door per pairing and
+        `check_doors` matches ANY door, so one satisfied pairing is a hit.
+        """
+        if not pairings or not compute:
+            return None
+        from bot.door_generator import _doors_from_pairings
+        all_doors = []
+        for pair in pairings:
+            all_doors.extend(_doors_from_pairings(
+                {"pairings": [pair], "threshold": 1}, pool_passives))
+        if not all_doors:
+            return None
+        p_m, p_c = compute(all_doors)
+        p = p_c if p_c > 1e-15 else p_m
+        return p if p and p > 0 else None
+
     def _update_odds(self):
         """Recompute and display odds for the current pool + threshold."""
         rtype  = self._relic_type
@@ -1671,6 +1724,10 @@ class _PassivePoolTab(ttk.Frame):
 
         lines: list[str] = []
         per_relic_probs: list[float] = []
+        # Indices of group-subtotal lines. With only ONE contributing group its
+        # subtotal IS the total, so it is dropped rather than printed twice —
+        # the same rule the combined view uses.
+        subtotal_idxs: list[int] = []
 
         pool_name = "Deep of Night" if rtype == "night" else "Normal"
 
@@ -1714,6 +1771,21 @@ class _PassivePoolTab(ttk.Frame):
             _pcl = _color_odds_line(self._color_select.get(), rtype, indent="    ")
             if _pcl:
                 lines.append(_pcl)
+
+        # Pool group subtotal — the odds of an actual MATCH from the pool.
+        # The per-passive lines above are the odds of each single passive
+        # appearing, which is a far likelier event than the threshold being
+        # met; without this line a "3 of 5" pool reads as if matches were
+        # roughly 1 in 100.
+        _pool_passives = DEEP_POOL_PASSIVES if rtype == "night" else NORMAL_POOL_PASSIVES
+        _p_pool_group = self._pool_group_probability(
+            _compute, self._entries, _pool_passives,
+            norm_colors(self._color_select.get()), thresh)
+        if _p_pool_group:
+            subtotal_idxs.append(len(lines))
+            lines.append(
+                f"    Odds from My Pool (≥{thresh}): {_fmt_pct(_p_pool_group*100)}%"
+                f"  (~1 in {int(round(1/_p_pool_group)):,} per relic)")
 
         # ── Pairing odds ─────────────────────────────────────────────────────
         if self._pairings:
@@ -1776,6 +1848,16 @@ class _PassivePoolTab(ttk.Frame):
         # ── Combined odds: P(any door matches) via complement product ─────
         # Generates ALL doors from pool entries + pairings combined, then
         # computes P(at least one door satisfied) using the enhanced engine.
+        # Pairings group subtotal — a union across every pairing, never a
+        # threshold: each pairing is a standalone door and any one is a hit.
+        _p_pair_group = self._pairings_group_probability(
+            _compute, self._pairings, _pool_passives)
+        if _p_pair_group:
+            subtotal_idxs.append(len(lines))
+            lines.append(
+                f"    Odds from Pairings: {_fmt_pct(_p_pair_group*100)}%"
+                f"  (~1 in {int(round(1/_p_pair_group)):,} per relic)")
+
         p_combined: float | None = None
         try:
             from bot.door_generator import generate_doors
@@ -1805,6 +1887,8 @@ class _PassivePoolTab(ttk.Frame):
                 p_combined = 1.0 - comp if comp < 1.0 else None
 
         if p_combined and p_combined > 0:
+            if len(subtotal_idxs) == 1:
+                del lines[subtotal_idxs[0]]
             n_combined = int(round(1.0 / max(p_combined, 1e-12)))
             pct_combined = p_combined * 100
             lines.append(
@@ -2549,24 +2633,18 @@ class RelicBuilderFrame(ttk.LabelFrame):
             if _pcl:
                 lines.append(_pcl)
 
-            # Pool-only subtotal (entries only, threshold applied)
+            # Pool-only subtotal (entries only, threshold applied).
+            # Computed by the SAME helper the pool tab uses, so the two panels
+            # cannot report different figures for the same configuration.
             thresh = self._pool._threshold.get()
-            entry_probs = []
-            for entry in pool_entries:
-                ed = [(frozenset([p]), "entry", _pool_cnorm)
-                      for p in entry["accepted"] if p in pool]
-                if ed:
-                    _, p_c = self.compute_enhanced_p(ed)
-                    if p_c and p_c > 0:
-                        entry_probs.append(p_c)
-            if entry_probs and len(entry_probs) >= thresh:
-                p_pool_only = prob_at_least_k_of_pool(entry_probs, thresh)
-                if p_pool_only and p_pool_only > 0:
-                    subtotal_idxs.append(len(lines))
-                    lines.append(
-                        f"    Odds from My Pool (\u2265{thresh}): {_fmt_pct(p_pool_only*100)}%"
-                        f"  (~1 in {int(round(1/p_pool_only)):,} per relic)")
-                    group_probs.append(p_pool_only)
+            p_pool_only = _PassivePoolTab._pool_group_probability(
+                self.compute_enhanced_p, pool_entries, pool, _pool_cnorm, thresh)
+            if p_pool_only:
+                subtotal_idxs.append(len(lines))
+                lines.append(
+                    f"    Odds from My Pool (\u2265{thresh}): {_fmt_pct(p_pool_only*100)}%"
+                    f"  (~1 in {int(round(1/p_pool_only)):,} per relic)")
+                group_probs.append(p_pool_only)
             lines.append("")
 
         # ── Pairings group ───────────────────────────────────────────────
@@ -2574,7 +2652,6 @@ class RelicBuilderFrame(ttk.LabelFrame):
         if pairings:
             lines.append("  Pairings:")
             from bot.door_generator import _doors_from_pairings
-            all_pair_doors = []
             for pair in pairings:
                 left = pair.get("left", [])
                 right = pair.get("right", [])
@@ -2590,7 +2667,6 @@ class RelicBuilderFrame(ttk.LabelFrame):
 
                 pair_doors = _doors_from_pairings(
                     {"pairings": [pair], "threshold": 1}, pool)
-                all_pair_doors.extend(pair_doors)
                 if pair_doors:
                     p_m, p_c = self.compute_enhanced_p(pair_doors)
                     p_p = p_c if p_c > 1e-15 else p_m
@@ -2606,16 +2682,15 @@ class RelicBuilderFrame(ttk.LabelFrame):
                 else:
                     lines.append(f"    {pair_label}  \u2192  not available in {pool_name} pool")
 
-            # Pairings subtotal
-            if all_pair_doors:
-                p_m, p_c = self.compute_enhanced_p(all_pair_doors)
-                p_pairs = p_c if p_c > 1e-15 else p_m
-                if p_pairs and p_pairs > 0:
-                    subtotal_idxs.append(len(lines))
-                    lines.append(
-                        f"    Odds from Pairings: {_fmt_pct(p_pairs*100)}%"
-                        f"  (~1 in {int(round(1/p_pairs)):,} per relic)")
-                    group_probs.append(p_pairs)
+            # Pairings subtotal — same helper as the pool tab.
+            p_pairs = _PassivePoolTab._pairings_group_probability(
+                self.compute_enhanced_p, pairings, pool)
+            if p_pairs:
+                subtotal_idxs.append(len(lines))
+                lines.append(
+                    f"    Odds from Pairings: {_fmt_pct(p_pairs*100)}%"
+                    f"  (~1 in {int(round(1/p_pairs)):,} per relic)")
+                group_probs.append(p_pairs)
             lines.append("")
 
         # ── TOTAL: P(ANY door matches) ───────────────────────────────────
