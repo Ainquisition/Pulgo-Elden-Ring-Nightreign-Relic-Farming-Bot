@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 ---
 
-## [1.9.5] — 2026-08-16 — LONG RUNS NO LONGER DIE ON A RELAUNCH
+## [1.9.5] — 2026-08-15 — LONG RUNS NO LONGER DIE ON A RELAUNCH
 
 ### Fixed
 - **The bot no longer relaunches the game before the last one has finished
