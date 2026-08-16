@@ -51,7 +51,7 @@ _APP_CONFIG_FILE    = os.path.join(_REPO_ROOT, "relicbot_config.json")
 
 # Single source of truth for the app version. Used in the window title and
 # embedded in diagnostic log headers so bug reports identify their build.
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.5"
 
 # Cross-flavor flag. Mainline = False, CE branch flips this to True.
 # Drives title string + support-link routing so the CE build deep-links to
@@ -579,6 +579,124 @@ def _boost_game_priority(exe_name: str) -> bool:
                 boosted = True
             _k32.CloseHandle(h)
     return boosted
+
+
+# ── Shutdown monitoring ────────────────────────────────────────────────── #
+# When we halt the game we MONITOR the processes we halted until they are
+# actually gone, rather than sleeping a fixed interval and hoping.  Closing the
+# game is not one process exiting: the game launches through a protector, which
+# owns an anti-cheat service and its host process, and all of them have to
+# finish before the next launch can succeed.
+#
+# What exposed it (2026-08-15): after 163 clean relaunches in a 19.8 h session,
+# relaunch 164 hit "Launch Error (30005) — CreateService failed with 1072"
+# (ERROR_SERVICE_MARKED_FOR_DELETE).  nightreign.exe had gone, so the bot
+# declared the game closed, waited a fixed buffer and relaunched into a
+# protector that had not finished tearing down.  The resulting modal belongs to
+# a DIFFERENT executable, so the launch loop -- which only asks whether
+# nightreign.exe runs and whether its window can be focused -- is blind to it,
+# and the batch was cancelled after 162 completed iterations.
+#
+# Dependents of the game process that must also exit before a relaunch.
+_GAME_DEPENDENT_EXES = (
+    "start_protected_game.exe",      # the protector/launcher that wraps the game
+    "EasyAntiCheat_EOS.exe",         # the anti-cheat service host
+)
+# Corroborating signal only.  The service is installed permanently (Manual
+# start), NOT created per launch, so "wait for it to disappear" would block
+# forever -- ABSENT and STOPPED are both settled.
+_GAME_GUARD_SERVICE = "EasyAntiCheat_EOS"
+_SERVICE_SETTLED    = ("ABSENT", "STOPPED")
+_SHUTDOWN_MAX_WAIT  = 45.0       # cap: a wedged dependent must not hang the run
+
+# Shutdown boundaries are LEARNED PER MACHINE, not shipped as fixed numbers.
+# A value tuned on one machine is wrong on faster and slower ones alike, so
+# these are only the starting points and the clamps; the operating values come
+# from what this machine is actually observed to do (relicbot_timing.json,
+# keyed by machine_id alongside the existing phase/OCR calibration).
+_GRACE_WINDOW_DEFAULT = 15.0     # let the game close itself before force-kill
+_GRACE_WINDOW_MIN     = 6.0
+_GRACE_WINDOW_MAX     = 30.0
+_SHUTDOWN_FLOOR_MIN   = 1.5      # the close floor may decay this far, no further
+_SHUTDOWN_FLOOR_CAP   = 7.0
+_SHUTDOWN_MIN_SAMPLES = 5        # observations before trusting the learned value
+
+_SERVICE_STATE_NAMES = {
+    1: "STOPPED", 2: "START_PENDING", 3: "STOP_PENDING", 4: "RUNNING",
+    5: "CONTINUE_PENDING", 6: "PAUSE_PENDING", 7: "PAUSED",
+}
+
+
+def _service_state(name: str) -> str:
+    """Read-only Windows service state.
+
+    Returns 'ABSENT', a state name ('STOPPED' / 'RUNNING' / ...), or
+    'UNKNOWN:<reason>'.  Never raises.  Verified to work UNELEVATED, which is
+    how the bot runs -- a probe that only works elevated would report
+    'UNKNOWN' forever on the machine that matters.
+
+    LOAD-BEARING: OpenSCManagerW and OpenServiceW return SC_HANDLE, which is a
+    POINTER.  Without an explicit restype ctypes assumes c_int and truncates
+    the handle to 32 bits on a 64-bit build -- the identical defect that
+    silently broke _process_integrity_level and made it return "".
+    """
+    from ctypes import wintypes          # imported locally, as elsewhere here
+
+    _SC_MANAGER_CONNECT   = 0x0001
+    _SERVICE_QUERY_STATUS = 0x0004
+    _ERR_NO_SUCH_SERVICE  = 1060
+    _ERR_ACCESS_DENIED    = 5
+
+    class _SERVICE_STATUS(ctypes.Structure):
+        _fields_ = [
+            ("dwServiceType", wintypes.DWORD),
+            ("dwCurrentState", wintypes.DWORD),
+            ("dwControlsAccepted", wintypes.DWORD),
+            ("dwWin32ExitCode", wintypes.DWORD),
+            ("dwServiceSpecificExitCode", wintypes.DWORD),
+            ("dwCheckPoint", wintypes.DWORD),
+            ("dwWaitHint", wintypes.DWORD),
+        ]
+
+    try:
+        adv = ctypes.windll.advapi32
+        adv.OpenSCManagerW.restype  = ctypes.c_void_p
+        adv.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                       wintypes.DWORD]
+        adv.OpenServiceW.restype    = ctypes.c_void_p
+        adv.OpenServiceW.argtypes   = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                       wintypes.DWORD]
+        adv.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+        adv.QueryServiceStatus.argtypes = [ctypes.c_void_p,
+                                           ctypes.POINTER(_SERVICE_STATUS)]
+
+        scm = adv.OpenSCManagerW(None, None, _SC_MANAGER_CONNECT)
+        if not scm:
+            return "UNKNOWN:scm_err_%d" % ctypes.GetLastError()
+        try:
+            # NOTE: a service marked for deletion stays alive until its LAST
+            # handle closes, so this probe closes its handle immediately.  Do
+            # not hold an SC handle open across the poll loop.
+            svc = adv.OpenServiceW(scm, name, _SERVICE_QUERY_STATUS)
+            if not svc:
+                err = ctypes.GetLastError()
+                if err == _ERR_NO_SUCH_SERVICE:
+                    return "ABSENT"
+                if err == _ERR_ACCESS_DENIED:
+                    return "UNKNOWN:access_denied"
+                return "UNKNOWN:open_err_%d" % err
+            try:
+                st = _SERVICE_STATUS()
+                if not adv.QueryServiceStatus(svc, ctypes.byref(st)):
+                    return "UNKNOWN:query_err_%d" % ctypes.GetLastError()
+                return _SERVICE_STATE_NAMES.get(
+                    st.dwCurrentState, "STATE_%d" % st.dwCurrentState)
+            finally:
+                adv.CloseServiceHandle(svc)
+        finally:
+            adv.CloseServiceHandle(scm)
+    except Exception as _e:
+        return "UNKNOWN:exc_%s" % type(_e).__name__
 
 
 class RelicBotApp(tk.Tk):
@@ -4733,10 +4851,13 @@ class RelicBotApp(tk.Tk):
         exe_name = os.path.basename(exe_path)
         # Adaptive close buffer — managed by _batch_loop, defaults to 7s.
         # Increases when launches fail, decreases when they succeed.
-        _close_buf = getattr(self, "_launch_close_buffer", 7.0)
+        # self.__dict__.get, never getattr: this class subclasses tk.Tk, whose
+        # __getattr__ forwards unknown names to self.tk and recurses forever on
+        # a __new__ instance (RecursionError, so the default never applies).
+        _close_buf = self.__dict__.get("_launch_close_buffer", 7.0)
         if not self._is_game_running(exe_name):
-            self._log("Game already not running — applying close buffer before relaunch…")
-            time.sleep(_close_buf)
+            self._log("Game already not running — waiting for shutdown to complete…")
+            self._wait_for_shutdown_complete(exe_name, _close_buf)
             return True
         self._log(f"Closing game ({exe_name})…")
         # Try graceful close first (WM_CLOSE) — this lets the game notify
@@ -4759,13 +4880,21 @@ class RelicBotApp(tk.Tk):
                         _user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0)
                     return True
                 _user32.EnumWindows(_WNDENUMPROC(_enum_cb), 0)
-                # Wait up to 8s for graceful exit
-                for _ in range(16):
+                # Wait for the game to close itself.  The window is LEARNED
+                # per machine, not a fixed 8 s: that cap expired on 155 of 163
+                # closes on the reference machine, so this path force-killed
+                # almost every time and the clean shutdown it exists to allow
+                # effectively never happened.
+                _grace_window = self._learned_graceful_window()
+                _g0 = time.time()
+                while time.time() - _g0 < _grace_window:
                     time.sleep(0.5)
                     if not self.bot_running:
                         return False
                     if not self._is_game_running(exe_name):
                         _graceful_closed = True
+                        self._record_shutdown_sample(
+                            graceful_secs=time.time() - _g0)
                         break
         except Exception:
             pass
@@ -4777,9 +4906,179 @@ class RelicBotApp(tk.Tk):
                 return False
             if not self._is_game_running(exe_name):
                 self._log("Game closed — waiting for cleanup…")
-                time.sleep(_close_buf)
+                self._wait_for_shutdown_complete(exe_name, _close_buf)
                 return True
         self._log("WARNING: Game did not close within 60s.")
+        return False
+
+    def _shutdown_stats(self, key: str) -> dict:
+        """Persisted shutdown observations for this machine.
+
+        self.__dict__.get, never getattr/self.attr: tk.Tk forwards unknown
+        names to self.tk, which does not exist on the __new__ instances every
+        harness here uses, so a plain read recurses to RecursionError.
+        """
+        _td = self.__dict__.get("_timing_data") or {}
+        return ((_td.get("shutdown") or {}).get(key) or {})
+
+    def _learned_graceful_window(self) -> float:
+        """How long to let the game close ITSELF before force-killing it.
+
+        Learned per machine rather than fixed.  A fixed 8 s cap force-killed
+        155 of 163 closes on the reference machine, so the clean-shutdown path
+        this window exists to allow almost never actually ran -- and a
+        force-killed game never runs its protector's teardown, which is what
+        leaves the guard service half-removed.
+
+        Converges on the observed worst case plus half again: a fast machine
+        settles near the minimum and stops paying for headroom it never uses,
+        a slow one is allowed the time it genuinely needs instead of being cut
+        off at a number picked on someone else's hardware.
+        """
+        _st = self._shutdown_stats("graceful")
+        if int(_st.get("n", 0) or 0) >= _SHUTDOWN_MIN_SAMPLES:
+            _worst = float(_st.get("max", 0.0) or 0.0)
+            if _worst > 0.0:
+                return max(_GRACE_WINDOW_MIN,
+                           min(_GRACE_WINDOW_MAX, _worst * 1.5 + 1.0))
+        return _GRACE_WINDOW_DEFAULT
+
+    def _shutdown_floor_min(self) -> float:
+        """Lowest the close floor is allowed to decay to on this machine.
+
+        The monitor already waits for the processes themselves, so this floor
+        covers only what cannot be observed -- the kernel finishing with a
+        process after it has left the table.  A machine that has repeatedly
+        settled fast is allowed well below the shipped default (worth ~13 min
+        across a 160-iteration run), but never below a hard minimum and never
+        below what this machine has actually been seen to need.
+        """
+        _floor = _SHUTDOWN_FLOOR_MIN
+        _st = self._shutdown_stats("settle")
+        if int(_st.get("n", 0) or 0) >= _SHUTDOWN_MIN_SAMPLES:
+            _floor = max(_floor, float(_st.get("max", 0.0) or 0.0) + 0.5)
+        return min(_floor, _SHUTDOWN_FLOOR_CAP)
+
+    def _record_shutdown_sample(self, settle_secs: float | None = None,
+                                graceful_secs: float | None = None) -> None:
+        """Record how long shutdown actually took, so the bounds above stop
+        being guesses.  Mirrors _record_timing_sample's lock contract: mutate
+        under the data lock, release, THEN save."""
+        _td = self.__dict__.get("_timing_data")
+        _lock = self.__dict__.get("_timing_data_lock")
+        if _td is None or _lock is None:
+            return                      # harness / pre-init: nothing to record
+        _dirty = False
+        with _lock:
+            _sd = _td.setdefault("shutdown", {})
+            for _key, _val in (("settle", settle_secs),
+                               ("graceful", graceful_secs)):
+                # Sanity bounds, as elsewhere: a freeze or a suspended laptop
+                # must not poison the learned bound forever.
+                if _val is None or not (0.0 <= _val < 120.0):
+                    continue
+                _e = _sd.setdefault(_key, {"n": 0, "sum": 0.0, "max": 0.0})
+                _e["n"] = int(_e.get("n", 0) or 0) + 1
+                _e["sum"] = float(_e.get("sum", 0.0) or 0.0) + _val
+                if _val > float(_e.get("max", 0.0) or 0.0):
+                    _e["max"] = _val
+                _dirty = True
+        if _dirty:
+            try:
+                self._save_timing_data()
+            except Exception:
+                pass
+
+    def _wait_for_shutdown_complete(self, exe_name: str,
+                                    min_wait: float = 0.0) -> bool:
+        """Monitor the processes we halted until they are actually gone.
+
+        `min_wait` is a FLOOR, not the whole wait.  The loop keeps watching
+        throughout it, so a machine that finishes early behaves exactly as it
+        did before, a slower one gets as long as it genuinely needs, and the
+        moment the last dependent exits is MEASURED rather than assumed.
+
+        The floor is kept deliberately -- a process leaving the table is not
+        proof the kernel has finished with it -- but because the real settle
+        time is now recorded per close, it becomes a number we can revisit
+        from field data instead of a boundary we guess at once and keep
+        forever.
+
+        This is the same correction P1 made to the shop recovery: the sibling
+        path polled for its precondition while the broken one slept a fixed
+        interval and then acted blind.
+
+        Returns True once everything is clear, False on the cap or user stop.
+        Never aborts the iteration -- a wedged dependent is better handled by
+        attempting the launch than by guaranteeing failure here.
+        """
+        _t0 = time.time()
+        _deadline = _t0 + _SHUTDOWN_MAX_WAIT
+        _settled_at = None          # measured teardown, independent of the floor
+        _announced = False
+        _svc_unknown = ""
+        _svc = ""
+        while self.bot_running:
+            _blockers = []
+            if self._is_game_running(exe_name):
+                _blockers.append(exe_name)
+            for _dep in _GAME_DEPENDENT_EXES:
+                if _pids_for_exe(_dep):
+                    _blockers.append(_dep)
+            _svc = _service_state(_GAME_GUARD_SERVICE)
+            if _svc.startswith("UNKNOWN"):
+                # Cannot read it -> fail OPEN and proceed as the bot always
+                # has.  Blocking here would cost the cap every iteration.
+                # Reported so it is never a silent downgrade.
+                _svc_unknown = _svc
+            elif _svc not in _SERVICE_SETTLED:
+                _blockers.append("%s=%s" % (_GAME_GUARD_SERVICE, _svc))
+
+            _elapsed = time.time() - _t0
+            if not _blockers and _settled_at is None:
+                _settled_at = _elapsed
+
+            if not _blockers and _elapsed >= min_wait:
+                self._record_shutdown_sample(settle_secs=_settled_at)
+                if _announced:
+                    self._log("  [Shutdown] All processes clear after %.1fs "
+                              "— relaunching." % (_settled_at or 0.0))
+                if _svc_unknown:
+                    self._log("  [Shutdown] NOTE: could not read the %s "
+                              "service state (%s) — proceeding."
+                              % (_GAME_GUARD_SERVICE, _svc_unknown))
+                if self._diag:
+                    try:
+                        self._diag.log_game(
+                            event="shutdown_clear", attempt=0,
+                            note="settled=%.1fs floor=%.1fs total=%.1fs svc=%s"
+                                 % (_settled_at or 0.0, min_wait, _elapsed, _svc))
+                    except Exception:
+                        pass
+                return True
+
+            if time.time() >= _deadline:
+                self._log("  [Shutdown] WARNING: %s still running after %.0fs "
+                          "— launching anyway. If the game fails to start with "
+                          "an anti-cheat error, close that window and the next "
+                          "attempt should succeed."
+                          % (", ".join(_blockers), _SHUTDOWN_MAX_WAIT))
+                if self._diag:
+                    try:
+                        self._diag.log_game(
+                            event="shutdown_timeout", attempt=0,
+                            note="blockers=%s" % ";".join(_blockers))
+                    except Exception:
+                        pass
+                return False
+
+            if _blockers and not _announced and _elapsed >= min_wait:
+                # Only speaks up once the floor is spent and something is STILL
+                # running, so a healthy close logs exactly as it always did.
+                self._log("  [Shutdown] Still waiting on %s to exit…"
+                          % ", ".join(_blockers))
+                _announced = True
+            time.sleep(0.5)
         return False
 
     def _shutdown_steam(self) -> bool:
@@ -7283,9 +7582,14 @@ class RelicBotApp(tk.Tk):
             # took this iteration.  This tunes the buffer in real time so
             # fast systems stay fast and slow systems get more room.
             if _launch_attempts <= 1:
-                # First attempt succeeded — system is healthy, slowly decay
+                # First attempt succeeded — system is healthy, slowly decay.
+                # The lower bound is LEARNED rather than a flat 5 s: on a
+                # machine whose shutdown is consistently observed to settle
+                # fast there is nothing left to wait for, and 5 s x ~160
+                # iterations is ~13 minutes of a long run spent on a boundary
+                # that machine never needed.  It rises again on any failure.
                 self._launch_close_buffer = max(
-                    5.0, self._launch_close_buffer - 1.0)
+                    self._shutdown_floor_min(), self._launch_close_buffer - 1.0)
             elif _steam_reset_done:
                 # Had to reset Steam — max out the buffer
                 self._launch_close_buffer = 15.0

@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 
 ---
 
+## [1.9.5] — 2026-08-16 — LONG RUNS NO LONGER DIE ON A RELAUNCH
+
+### Fixed
+- **The bot no longer relaunches the game before the last one has finished
+  closing.** Closing the game is not one program exiting — it starts through a
+  protector that runs an anti-cheat service, and all of it has to finish first.
+  The bot used to wait only for the game itself to disappear, pause for a few
+  seconds, and start again. Usually that was enough. Occasionally it was not,
+  and the next launch failed with an anti-cheat error the bot could not see,
+  which ended the run. In one 20-hour session that happened once, on the 164th
+  relaunch, and cancelled a batch that had already completed 162 iterations.
+  The bot now watches everything involved in the shutdown and waits until it is
+  genuinely finished.
+- **This is why it tended to happen late in long sessions.** Each relaunch
+  carried the same small risk, so the longer a run went, the more chances it had
+  to hit it. A short run almost never would.
+
+### Changed
+- **Shutdown timing now adapts to your PC instead of using fixed numbers.** How
+  long the bot allows the game to close itself, and how long it waits afterwards,
+  are now learned from what your machine actually does, and are stored with the
+  existing per-machine calibration. A fast PC stops waiting for time it never
+  needed — worth several minutes across a long run — and a slower PC is given the
+  time it genuinely takes instead of being cut off. Both settle automatically
+  after a handful of iterations; there is nothing to configure.
+- **The game is now given a proper chance to close itself.** The previous limit
+  was short enough that the bot ended up force-closing the game on almost every
+  iteration, which is what left the anti-cheat half shut down in the first place.
+
+---
+
 ## [1.9.4] — 2026-08-14 — SHOP RECOVERY, CLEARER ODDS, AND A BRANCHING OVERLAY THAT MAKES SENSE
 
 ### Fixed
