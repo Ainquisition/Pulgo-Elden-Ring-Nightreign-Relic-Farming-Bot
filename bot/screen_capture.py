@@ -4,18 +4,165 @@ Returns JPEG bytes consumed by the local OCR analyser.
 """
 
 import io
+import os
+import time
 from typing import Optional, Tuple
 from PIL import Image
 import mss
 
 _JPEG_QUALITY = 85
+_GAME_EXE = "nightreign.exe"
+_MONITOR_CACHE_TTL = 1.0
+_monitor_cache = {"expires": 0.0, "exe": None, "monitor": None}
+
+
+def _game_monitor(exe_name: str = _GAME_EXE):
+    """Return the physical monitor containing the game's top-level window.
+
+    ``mss.monitors[1]`` is not guaranteed to be the Windows primary display;
+    on mixed-DPI multi-monitor systems it may be a different physical screen.
+    Resolve the monitor from the game's HWND instead.  Any Win32/query failure
+    returns ``None`` so callers retain the original monitor-selection fallback.
+    """
+    now = time.monotonic()
+    target = os.path.basename(exe_name).lower()
+    if (target == _monitor_cache["exe"]
+            and now < _monitor_cache["expires"]):
+        return _monitor_cache["monitor"]
+
+    monitor = None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            candidates = []
+
+            kernel32.OpenProcess.argtypes = [
+                wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.QueryFullProcessImageNameW.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                ctypes.POINTER(wintypes.DWORD)]
+            kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            enum_proc_type = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def _enum_window(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                process = kernel32.OpenProcess(0x1000, False, pid.value)
+                if not process:
+                    return True
+                try:
+                    path = ctypes.create_unicode_buffer(32768)
+                    size = wintypes.DWORD(len(path))
+                    ok = kernel32.QueryFullProcessImageNameW(
+                        process, 0, path, ctypes.byref(size))
+                finally:
+                    kernel32.CloseHandle(process)
+
+                if not ok or os.path.basename(path.value).lower() != target:
+                    return True
+
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    area = max(0, rect.right - rect.left) * max(
+                        0, rect.bottom - rect.top)
+                    candidates.append((area, hwnd))
+                return True
+
+            callback = enum_proc_type(_enum_window)
+            user32.EnumWindows(callback, 0)
+
+            if candidates:
+                # Prefer the real game surface if the process owns helper
+                # windows as well.
+                hwnd = max(candidates, key=lambda item: item[0])[1]
+
+                class _MONITORINFOEXW(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szDevice", wintypes.WCHAR * 32),
+                    ]
+
+                user32.MonitorFromWindow.argtypes = [
+                    wintypes.HWND, wintypes.DWORD]
+                user32.MonitorFromWindow.restype = ctypes.c_void_p
+                user32.GetMonitorInfoW.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(_MONITORINFOEXW)]
+                user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+                hmonitor = user32.MonitorFromWindow(hwnd, 2)
+                info = _MONITORINFOEXW()
+                info.cbSize = ctypes.sizeof(info)
+                if hmonitor and user32.GetMonitorInfoW(
+                        hmonitor, ctypes.byref(info)):
+                    rect = info.rcMonitor
+                    width = rect.right - rect.left
+                    height = rect.bottom - rect.top
+                    if width > 0 and height > 0:
+                        monitor = {
+                            "left": rect.left,
+                            "top": rect.top,
+                            "width": width,
+                            "height": height,
+                            "device": info.szDevice,
+                            "source": "game_window",
+                        }
+        except Exception:
+            monitor = None
+
+    _monitor_cache["exe"] = target
+    _monitor_cache["monitor"] = monitor
+    _monitor_cache["expires"] = now + _MONITOR_CACHE_TTL
+    return monitor
+
+
+def _capture_monitor(sct):
+    """Select the game's monitor, falling back to the legacy MSS display."""
+    monitor = _game_monitor()
+    if monitor is not None:
+        return monitor
+    legacy = dict(sct.monitors[1])
+    legacy["device"] = "MSS monitor 1"
+    legacy["source"] = "legacy_fallback"
+    return legacy
+
+
+def get_capture_monitor_info(exe_name: str = _GAME_EXE) -> dict:
+    """Return capture bounds plus selection source for diagnostics."""
+    monitor = _game_monitor(exe_name)
+    if monitor is not None:
+        return dict(monitor)
+    with mss.mss() as sct:
+        legacy = dict(sct.monitors[1])
+    legacy["device"] = "MSS monitor 1"
+    legacy["source"] = "legacy_fallback"
+    return legacy
 
 
 def get_screen_size() -> Tuple[int, int]:
-    """Return (width, height) of the primary monitor in pixels."""
+    """Return (width, height) of the game monitor in physical pixels."""
     with mss.mss() as sct:
-        m = sct.monitors[1]
+        m = _capture_monitor(sct)
         return m["width"], m["height"]
+
+
+def _mss_box(monitor: dict) -> dict:
+    """Strip diagnostic keys before handing monitor bounds to MSS."""
+    return {key: monitor[key] for key in ("left", "top", "width", "height")}
 
 
 def capture(region: Optional[Tuple[int, int, int, int]] = None,
@@ -25,7 +172,7 @@ def capture(region: Optional[Tuple[int, int, int, int]] = None,
 
     Args:
         region: (left, top, width, height) in screen coordinates.
-                If None, captures the primary monitor.
+                If None, captures the monitor containing the game window.
         with_compare_crop: If True, also return a small numpy crop of the
                 description area (name + passives) extracted from raw pixels
                 before JPEG encoding.  Used for duplicate relic detection.
@@ -39,9 +186,9 @@ def capture(region: Optional[Tuple[int, int, int, int]] = None,
             left, top, width, height = region
             monitor = {"left": left, "top": top, "width": width, "height": height}
         else:
-            monitor = sct.monitors[1]  # Primary monitor
+            monitor = _capture_monitor(sct)
 
-        screenshot = sct.grab(monitor)
+        screenshot = sct.grab(_mss_box(monitor))
 
     img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
@@ -189,8 +336,8 @@ def _grab_screen(region=None):
             left, top, width, height = region
             monitor = {"left": left, "top": top, "width": width, "height": height}
         else:
-            monitor = sct.monitors[1]
-        shot = sct.grab(monitor)
+            monitor = _capture_monitor(sct)
+        shot = sct.grab(_mss_box(monitor))
     w = shot.width
     h = shot.height
     arr = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(h, w, 4)
