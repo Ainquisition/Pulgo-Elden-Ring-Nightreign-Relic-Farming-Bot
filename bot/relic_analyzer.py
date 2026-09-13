@@ -49,11 +49,15 @@ _USE_BUNDLED_MODELS = _MODEL_DIR is not None
 
 # ── Navigator OCR isolation ──────────────────────────────────────────── #
 # nav_ocr() is the single entry point for main-thread navigation OCR.
-# GPU mode: priority gate — analysis workers acquire _gpu_inflight_lock
+# CUDA mode: priority gate — analysis workers acquire _gpu_inflight_lock
 #   around their reader.readtext() calls and yield while _nav_wants_gpu
 #   is set, so nav jumps the queue without pre-emption.
-# CPU mode: dedicated nav thread with its own EasyOCR Reader, higher
-#   OS priority, and an affinity mask disjoint from the analysis mask.
+# CPU and DirectML modes: dedicated CPU nav thread with its own EasyOCR
+#   Reader, higher OS priority, and an affinity mask disjoint from the
+#   analysis mask. DirectML remains reserved for the large relic-analysis
+#   crops: on tiny numeric UI crops its ONNX path can merge the Murk icon
+#   into the amount (for example 12,600 -> 612,600), defeating the buy-count
+#   safety fallback.
 
 _nav_wants_gpu       = threading.Event()
 _gpu_inflight_lock   = threading.Lock()
@@ -78,6 +82,23 @@ _nav_thread: "threading.Thread | None" = None
 _nav_queue: "queue.Queue | None"        = None
 _nav_thread_started = False
 _nav_started_lock   = threading.Lock()
+
+
+def _navigation_uses_cuda() -> bool:
+    """Return True only when navigation OCR should use the GPU reader.
+
+    The original CUDA path is retained for NVIDIA systems.  DirectML is kept
+    out of control-flow OCR (menus, counters, buy dialogs) and used only by
+    relic-analysis workers; the CPU EasyOCR reader is more reliable on those
+    small UI crops and their cost is negligible compared with relic OCR.
+    """
+    if not _gpu_mode_enabled:
+        return False
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def register_input_pause_hook(fn) -> None:
@@ -152,8 +173,8 @@ def start_nav_worker() -> None:
     """Start the dedicated CPU nav thread if not yet running.  Safe to call
     multiple times — if the existing thread is alive, this is a no-op; if
     it died (or was never started), a fresh thread is spawned and the
-    queue is recreated.  No-op in GPU mode — the priority-gate path
-    handles nav routing without a dedicated thread."""
+    queue is recreated. CUDA navigation normally uses the priority-gate path;
+    CPU and DirectML runs use this worker."""
     global _nav_thread, _nav_queue, _nav_thread_started
     with _nav_started_lock:
         if _nav_thread is not None and _nav_thread.is_alive():
@@ -177,11 +198,25 @@ def _nav_inline_fallback(crop_bgr, kw):
             _pause_inputs_for_nav(True)
         except Exception:
             pass
+    _sentinel = object()
+    _previous_device = getattr(_thread_device_local, "use_gpu", _sentinel)
+    # This fallback belongs to the CPU navigation path.  Without the explicit
+    # override a DirectML run would silently fall back to DirectML again when
+    # its dedicated CPU worker times out, reintroducing the OCR discrepancy
+    # this path is meant to avoid.
+    _thread_device_local.use_gpu = False
     try:
         with _owned_gpu_lock("nav_inline_fallback"):
             reader = _get_reader()
             return reader.readtext(crop_bgr, **kw)
     finally:
+        if _previous_device is _sentinel:
+            try:
+                delattr(_thread_device_local, "use_gpu")
+            except AttributeError:
+                pass
+        else:
+            _thread_device_local.use_gpu = _previous_device
         _nav_wants_gpu.clear()
         if _pause_inputs_for_nav is not None:
             try:
@@ -192,13 +227,14 @@ def _nav_inline_fallback(crop_bgr, kw):
 
 def nav_ocr(crop_bgr, *, name_only=False, **kw):
     """OCR call for the main thread / navigation.  Routes through the
-    priority gate (GPU) or the dedicated nav thread (CPU) so navigation
-    never contends with analysis workers.
+    priority gate (CUDA) or the dedicated nav thread (CPU / DirectML runs)
+    so navigation never contends with analysis workers. DirectML acceleration
+    remains active in relic-analysis worker threads.
 
     name_only — reserved for future lightweight name-band OCR path.
     """
     global _nav_thread_started
-    if _gpu_mode_enabled:
+    if _navigation_uses_cuda():
         _nav_wants_gpu.set()
         if _pause_inputs_for_nav is not None:
             try:
@@ -456,7 +492,10 @@ def set_thread_device(gpu) -> None:
 
 
 def set_gpu_mode(enabled: bool) -> None:
-    """Enable or disable GPU (CUDA) inference for all subsequent OCR calls.
+    """Enable or disable GPU inference for all subsequent OCR calls.
+
+    NVIDIA uses the original CUDA EasyOCR path. Systems without CUDA can use
+    the experimental ONNX Runtime DirectML adapter when it is installed.
 
     Each worker thread checks this flag before each call and reloads its Reader
     if the setting has changed, so toggling mid-run takes effect on the next
@@ -489,11 +528,34 @@ def _get_reader():
         except Exception:
             pass
         import easyocr
-        _reader_kwargs = {"gpu": _use_gpu, "verbose": False}
+        _reader_kwargs = {"verbose": False}
         if _USE_BUNDLED_MODELS:
             _reader_kwargs["model_storage_directory"] = _MODEL_DIR
             _reader_kwargs["download_enabled"] = False
-        _thread_local.reader     = easyocr.Reader(["en"], **_reader_kwargs)
+
+        if _use_gpu:
+            # Preserve the original NVIDIA/CUDA path when CUDA torch is present.
+            # Otherwise use ONNX Runtime DirectML (AMD/Intel/NVIDIA DX12 GPUs).
+            _cuda_ok = False
+            try:
+                import torch
+                _cuda_ok = bool(torch.cuda.is_available())
+            except Exception:
+                pass
+
+            if _cuda_ok:
+                _thread_local.reader = easyocr.Reader(["en"], gpu=True, **_reader_kwargs)
+            else:
+                from bot.directml_easyocr import create_directml_reader
+                _thread_local.reader = create_directml_reader(
+                    ["en"],
+                    model_storage_directory=_MODEL_DIR if _USE_BUNDLED_MODELS else None,
+                    download_enabled=not _USE_BUNDLED_MODELS,
+                    verbose=False,
+                )
+        else:
+            _thread_local.reader = easyocr.Reader(["en"], gpu=False, **_reader_kwargs)
+
         _thread_local.reader_gpu = _use_gpu
     return _thread_local.reader
 
@@ -1950,5 +2012,4 @@ def verify_shop_item(image_bytes: bytes, relic_type: str) -> tuple:
                 return False, "Old-version Scenic Flatstone ('1.02' in description)"
             return True, "OK"
         return False, "'Scenic Flatstone' not found in tooltip — inconclusive OCR"
-
 

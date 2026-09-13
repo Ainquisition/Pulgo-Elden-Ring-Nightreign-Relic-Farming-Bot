@@ -1,4 +1,21 @@
-# Elden Ring Nightreign – Relic Bot
+# Elden Ring Nightreign – Relic Bot (DirectML fork)
+
+> [!IMPORTANT]
+> This branch is an unofficial experimental fork of
+> [PulgoMaster's RelicBot](https://github.com/PulgoMaster/Pulgo-Elden-Ring-Nightreign-Relic-Farming-Bot).
+> It adds ONNX Runtime DirectML GPU acceleration for AMD and Intel GPUs on
+> Windows while preserving the original CUDA path for NVIDIA hardware.
+
+Tested on Windows 10 with an AMD Radeon RX 9070 XT. This branch also includes
+CPU EasyOCR routing for navigation/control recognition, multi-monitor capture,
+startup-state validation, and partial-purchase OCR fixes.
+
+See [DIRECTML_WINDOWS10.md](DIRECTML_WINDOWS10.md) for source installation,
+DirectML model setup, verification, and build instructions. The original
+release downloads linked later in this README do not contain this fork's
+DirectML changes.
+
+---
 
 Automates relic farming in **Elden Ring Nightreign** using on-device OCR to analyze relics and match them against your criteria.
 

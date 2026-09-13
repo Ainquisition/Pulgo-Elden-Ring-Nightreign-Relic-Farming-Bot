@@ -15,6 +15,15 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('skimage')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+# Experimental DirectML path. Keep this conditional so the original CPU/CUDA
+# build still works when onnxruntime-directml is not installed in the builder.
+try:
+    tmp_ret = collect_all('onnxruntime')
+    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    print('[Spec] ONNX Runtime collected for DirectML support')
+except Exception as _ort_collect_err:
+    print(f'[Spec] ONNX Runtime not collected: {_ort_collect_err}')
+
 # Include assets, relic icons, default sequences, and user-facing docs in the bundle
 datas += [
     ('assets/icon.ico', 'assets'),
@@ -69,6 +78,17 @@ for _pth_name in _MODEL_URLS:
     _p = _os.path.join(_model_cache_dir, _pth_name)
     if _os.path.exists(_p):
         datas.append((_p, 'easyocr_models'))
+
+
+# Bundle DirectML ONNX models when tools/setup_directml.py has populated them.
+_dml_model_dir = _os.path.join(_os.path.dirname(_os.path.abspath('relic_bot.spec')), 'directml_models')
+for _onnx_name in ('craft_mlt_25k.onnx', 'english_g2.onnx'):
+    _onnx_path = _os.path.join(_dml_model_dir, _onnx_name)
+    if _os.path.exists(_onnx_path):
+        datas.append((_onnx_path, 'directml_models'))
+        print(f'[Spec] Bundling DirectML model: {_onnx_name}')
+    else:
+        print(f'[Spec] DirectML model not present (CPU/CUDA-only build): {_onnx_name}')
 
 a = Analysis(
     ['main.py'],

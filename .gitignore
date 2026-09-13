@@ -10,14 +10,34 @@ dist/
 # Keep the release-build spec so reviewers can reproduce the published EXE
 !relic_bot.spec
 
-# User-specific profiles (save paths, input sequences, settings)
+# User-specific profiles and runtime state
 profiles/
+relicbot_config.json
+relicbot_calibration.json
+relicbot_timing.json
+last_run_diag.json
+.last_profile
+gpu_upgrade_ready
+gpu_upgrade.log
 
 # Runtime output folders — keep the folder, ignore the contents
 save_backups/*
 !save_backups/.gitkeep
 batch_output/*
 !batch_output/.gitkeep
+failure_dumps/
+buy_qty_fails/
+*.log
+*.diag
+*.sl2
+
+# DirectML models are downloaded/generated locally by setup_directml.py
+directml_models/
+
+# Local archives and virtual environments
+*.7z
+.venv/
+venv/
 
 # Environment / secret files
 .env

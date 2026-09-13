@@ -85,6 +85,24 @@ def _update_channel() -> str:
         return "github"
 
 
+def _menu_highlight_probe(menu_order, current_item):
+    """Return (key, expected_item) for a non-destructive menu probe.
+
+    A static blue area on the title logo can line up with a Roundtable menu
+    row.  Requiring the detected highlight to move exactly one row after a
+    key press distinguishes a real menu from those look-alike pixels.
+    """
+    try:
+        index = menu_order.index(current_item)
+    except (AttributeError, ValueError):
+        return None
+    if index + 1 < len(menu_order):
+        return "Key.down", menu_order[index + 1]
+    if index > 0:
+        return "Key.up", menu_order[index - 1]
+    return None
+
+
 def _detect_steam_exe(game_exe: str = "") -> str:
     """Try to find steam.exe automatically.
 
@@ -850,6 +868,9 @@ class RelicBotApp(tk.Tk):
         self._gpu_accel_var         = tk.BooleanVar(value=False)
         self._hw_ram_gb, self._hw_cpu_cores, self._hw_gpu_name = self._detect_hardware()
         self._hw_cuda_available, self._hw_cuda_error = self._check_cuda_available()
+        self._hw_directml_available, self._hw_directml_error = self._check_directml_available()
+        self._hw_gpu_accel_available = bool(self._hw_cuda_available or self._hw_directml_available)
+        self._hw_gpu_backend = "CUDA" if self._hw_cuda_available else ("DirectML" if self._hw_directml_available else "")
         self._hw_cuda_torch_installed = self._cuda_torch_installed()
         # Real import check of the OCR stack. Runs before the user can start a
         # batch, so a damaged install is reported up front instead of surfacing
@@ -1612,7 +1633,8 @@ class RelicBotApp(tk.Tk):
                  "  • GPU Acceleration must be installed\n\n"
                  "Defaults to 1 GPU worker + 1 CPU worker.\n"
                  "Enable 'Additional CPU Workers' to add more CPU workers (capped at 4).\n\n"
-                 "GPU worker uses CUDA; CPU workers use the processor.")
+                 "GPU worker uses the detected CUDA or DirectML backend; "
+                 "CPU workers use the processor.")
 
         # GPU Always Analyze — sub-option of Hybrid mode only
         _gpu_aa_chk = ttk.Checkbutton(
@@ -2014,13 +2036,10 @@ class RelicBotApp(tk.Tk):
             command=_on_gpu_toggle,
         )
         gpu_chk.grid(row=0, column=0, columnspan=2, sticky="w", **pad)
-        # Gray out GPU Acceleration toggle (and via downstream cascade in
-        # _update_async_sub_state, the Hybrid + GPU AA settings) when CUDA
-        # isn't actually available on this machine. Prevents users from
-        # toggling features that have no effect without a working CUDA setup.
-        # The "Install GPU Acceleration" button below stays clickable so users
-        # CAN install CUDA torch when their hardware is eligible.
-        if not self._hw_cuda_available:
+        # Gray out GPU Acceleration when neither CUDA nor the experimental
+        # DirectML OCR runtime is available. The NVIDIA installer below remains
+        # available only for the original CUDA path.
+        if not self._hw_gpu_accel_available:
             gpu_chk.configure(state="disabled")
             # Force the var to False so the existing trace cascade grays
             # _hyb_chk and _gpu_aa_chk too (and so persisted state from a
@@ -2028,18 +2047,16 @@ class RelicBotApp(tk.Tk):
             # leak GPU mode in unintentionally).
             self._gpu_accel_var.set(False)
         _Tooltip(gpu_chk,
-                 "Offloads OCR inference to your NVIDIA GPU (CUDA) instead of the CPU.\n"
-                 "Adds exactly 1 dedicated GPU worker — CUDA inference does not benefit\n"
-                 "from multiple workers competing for the same GPU context.\n\n"
-                 "Speed: ~0.3 s/relic (GPU) vs ~3 s/relic (CPU) — ~10× faster.\n\n"
+                 "Offloads OCR neural-network inference to the GPU.\n"
+                 "NVIDIA keeps the original CUDA path; AMD/Intel can use the\n"
+                 "experimental ONNX Runtime DirectML path.\n\n"
+                 "RelicBot intentionally uses exactly 1 GPU worker. DirectML sessions\n"
+                 "are run sequentially, and the existing GPU lock preserves that rule.\n\n"
                  "When GPU Acceleration is on without Hybrid mode:\n"
                  "  • Only the GPU worker runs — additional CPU workers are ignored\n"
                  "  • Enable Hybrid GPU+CPU to run CPU workers alongside the GPU worker\n\n"
-                 "Requirements:\n"
-                 "  • NVIDIA GPU with CUDA support (GTX 10xx or newer)\n"
-                 "  • PyTorch with CUDA installed (see Hardware panel below)\n\n"
-                 "Leave OFF if you do not have an NVIDIA GPU or CUDA is not detected.\n"
-                 "AMD and Intel GPUs are not supported.\n"
+                 "DirectML requires onnxruntime-directml plus the two ONNX OCR models.\n"
+                 "Run tools\\setup_directml.py and tools\\check_directml.py first.\n"
                  "GPU setting is saved in your profile.")
 
         # "+1 GPU Worker" badge — shown only when GPU Accel is enabled
@@ -2050,9 +2067,9 @@ class RelicBotApp(tk.Tk):
         self._gpu_worker_lbl.grid(row=0, column=2, columnspan=2, sticky="w", **pad)
         _Tooltip(self._gpu_worker_lbl,
                  "GPU Acceleration adds exactly 1 dedicated GPU worker to the pool.\n\n"
-                 "EasyOCR CUDA inference serializes within one GPU context — extra\n"
-                 "GPU workers fight over VRAM and slow each other down rather than\n"
-                 "improving throughput.  1 GPU worker at ~0.3 s/relic is optimal.\n\n"
+                 "GPU inference is serialized within one device context — extra\n"
+                 "GPU workers can contend for the same device rather than improve\n"
+                 "throughput. RelicBot therefore keeps one dedicated GPU worker.\n\n"
                  "To also run CPU workers alongside it, enable Hybrid GPU+CPU mode.")
         if not self._gpu_accel_var.get():
             self._gpu_worker_lbl.grid_remove()
@@ -2062,29 +2079,31 @@ class RelicBotApp(tk.Tk):
             foreground=theme.TEXT_MUTED,
         )
         self._gpu_rec_lbl.grid(row=0, column=4, columnspan=3, sticky="w", **pad)
-        # Set recommendation label based on CUDA detection
+        # Set recommendation label based on the runtime actually available
         if self._hw_cuda_available:
             self._gpu_rec_lbl.configure(
                 text=f"✓ Recommended — CUDA detected on {self._hw_gpu_name}",
                 foreground="#7ec8f0",
             )
+        elif self._hw_directml_available:
+            self._gpu_rec_lbl.configure(
+                text=f"✓ DirectML detected — GPU OCR available on {self._hw_gpu_name}",
+                foreground="#7ec8f0",
+            )
         elif self._hw_cuda_torch_installed:
-            # CUDA torch files are present but torch.cuda.is_available() returned False.
-            # Likely cause: _apply_gpu_upgrade() ran successfully but CUDA init still fails
-            # (driver mismatch, missing system runtime, etc.). Show the actual error.
             _err_short = self._hw_cuda_error[:80] if self._hw_cuda_error else "unknown error"
             self._gpu_rec_lbl.configure(
                 text=f"GPU torch installed — CUDA init failed: {_err_short}",
                 foreground="#e0c050",
             )
-        elif self._hw_cuda_error:
+        elif self._hw_directml_error:
             self._gpu_rec_lbl.configure(
-                text=f"CUDA unavailable: {self._hw_cuda_error[:80]}",
+                text=f"DirectML unavailable: {self._hw_directml_error[:95]}",
                 foreground="#e09050",
             )
         else:
             self._gpu_rec_lbl.configure(
-                text="No CUDA GPU detected — CPU mode only",
+                text="No supported GPU OCR runtime detected — CPU mode only",
                 foreground=theme.TEXT_MUTED,
             )
 
@@ -2092,10 +2111,10 @@ class RelicBotApp(tk.Tk):
         # Enabled only when: NVIDIA GPU compatible (compute ≥ 6.1, driver ≥ 572.13)
         #                    AND CUDA is not already working.
         # Grayed out for: incompatible hardware, outdated drivers, or CUDA already installed.
-        if self._hw_cuda_available:
-            _ibtn_text  = "GPU Already Installed"
+        if self._hw_gpu_accel_available:
+            _ibtn_text  = "GPU Runtime Available"
             _ibtn_state = "disabled"
-            _ibtn_tip   = "CUDA is already available and working on this system."
+            _ibtn_tip   = f"{self._hw_gpu_backend} GPU acceleration is already available and working."
         elif self._hw_cuda_torch_installed and self._gpu_eligible:
             # Files are present but CUDA failed — allow reinstall
             _ibtn_text  = "Reinstall GPU Acceleration"
@@ -2147,7 +2166,8 @@ class RelicBotApp(tk.Tk):
 
         ram_str  = f"{self._hw_ram_gb} GB" if self._hw_ram_gb else "unknown"
         cpu_str  = f"{self._hw_cpu_cores} logical cores" if self._hw_cpu_cores else "unknown"
-        cuda_str = "CUDA available" if self._hw_cuda_available else "no CUDA"
+        cuda_str = (f"{self._hw_gpu_backend} available" if self._hw_gpu_accel_available
+                    else "CPU OCR only")
         ttk.Label(
             hw_frame,
             text=(f"Detected:  {self._hw_gpu_name}  ({cuda_str})  |  "
@@ -3080,8 +3100,8 @@ class RelicBotApp(tk.Tk):
     # of those is live — never the other way round.
 
     def _eff_gpu_accel(self) -> bool:
-        """GPU acceleration — parent: CUDA actually present on this machine."""
-        return bool(self._gpu_accel_var.get()) and bool(self._hw_cuda_available)
+        """GPU acceleration — parent: CUDA or DirectML runtime is available."""
+        return bool(self._gpu_accel_var.get()) and bool(self._hw_gpu_accel_available)
 
     def _eff_backlog(self) -> bool:
         """Backlog Mode — top-level analysis mode, takes priority over Async."""
@@ -5651,6 +5671,7 @@ class RelicBotApp(tk.Tk):
         # dialog is seen while _game_rendered is already False. Same
         # unbindable-name class as v1.8.10.
         _dialog_logged = False
+        _highlight_reject_logged = False
 
         self._log("[Phase -0.5] Adaptive load wait — watching for in-game state…")
 
@@ -5840,29 +5861,41 @@ class RelicBotApp(tk.Tk):
 
                 _equip_found = relic_analyzer.check_text_visible(
                     _img, "equipment", top_fraction=0.15)
-                # Fallback: if OCR can't find "equipment" text, check whether
-                # any menu highlight is visible. A detectable highlight after
-                # ESC proves a menu is open, which proves we're in-game.
+                # Fallback: if OCR cannot find "equipment", validate the menu
+                # mechanically. A blue area at a known row is not enough: the
+                # NIGHTREIGN title logo overlaps the visual_codex row and used
+                # to produce a false in-game confirmation on "Checking save
+                # data...". A real menu highlight must move exactly one row in
+                # response to a probe key.
                 if not _equip_found and _game_rendered:
                     try:
                         _hl_item, _hl_br, _ = screen_capture.find_highlighted_item(region)
                         if _hl_item is not None:
                             if _fg_ok:
-                                _equip_found = True
-                                self._log(
-                                    f"[Phase -0.5] Menu highlight detected "
-                                    f"({_hl_item}) — confirming in-game via "
-                                    f"highlight fallback.")
-                                # This confirm is the weak one: it accepts a
-                                # rendered highlight without ever reading
-                                # "equipment". When it is wrong, everything
-                                # downstream fails for reasons that look like
-                                # dropped input. Keep the frame it decided on.
-                                self._dump_unrecognised_screen(
-                                    "fallback_confirm", region, image=_img,
-                                    note=(f"confirmed in-game from highlight "
-                                          f"'{_hl_item}' alone; 'equipment' was "
-                                          f"not found"))
+                                _probe = _menu_highlight_probe(
+                                    self._MENU_ORDER, _hl_item)
+                                if _probe is not None:
+                                    _probe_key, _expected_hl = _probe
+                                    self.player.tap(_probe_key)
+                                    _probe_settle = 0.45 * max(
+                                        1.0, self._perf_gap_mult)
+                                    time.sleep(_probe_settle)
+                                    _moved_item, _moved_br, _ = (
+                                        screen_capture.find_highlighted_item(region))
+                                    if _moved_item == _expected_hl:
+                                        _equip_found = True
+                                        self._log(
+                                            f"[Phase -0.5] Menu highlight "
+                                            f"validated ({_hl_item} → "
+                                            f"{_moved_item}) — confirming "
+                                            f"in-game via movement fallback.")
+                                    elif not _highlight_reject_logged:
+                                        _highlight_reject_logged = True
+                                        self._log(
+                                            f"[Phase -0.5] Highlight-like pixels "
+                                            f"at {_hl_item} did not move to "
+                                            f"{_expected_hl} — rejecting fallback "
+                                            f"and continuing startup checks.")
                             else:
                                 # Highlight is visible but the game does NOT hold
                                 # focus, so ESC/DOWN won't land — confirming here
@@ -6607,30 +6640,18 @@ class RelicBotApp(tk.Tk):
                     f"  Run config: {int(limit_value)} iteration(s) | "
                     f"{_rtype_label} | {' + '.join(_mode_parts)}"
                     + (f" | Custom launcher" if _custom else ""))
+                if (self._eff_gpu_accel()
+                        and self._hw_gpu_backend == "DirectML"):
+                    self._log(
+                        "  OCR routing: controls/navigation = CPU EasyOCR | "
+                        "relic analysis = DirectML")
                 # ── Resolution compatibility check ────────────────────────
                 try:
                     from bot.screen_capture import get_screen_size
                     _sw, _sh = get_screen_size()
-                    self._log(f"  Display: {_sw}x{_sh}")
-                    _is_16_9 = abs(_sw / _sh - 16 / 9) < 0.02
-                    _standard = {
-                        (1280, 720), (1366, 768), (1600, 900),
-                        (1920, 1080), (2560, 1440), (3840, 2160),
-                    }
-                    if not _is_16_9:
-                        self._log(
-                            f"  NOTE: Display aspect ratio ({_sw}:{_sh}) is not "
-                            f"16:9. The bot's screen detection is calibrated for "
-                            f"16:9 displays. Non-16:9 setups may cause detection "
-                            f"issues. If the bot gets stuck, try setting your game "
-                            f"to a standard 16:9 resolution (1920x1080 recommended) "
-                            f"in Fullscreen or Borderless Fullscreen mode.")
-                    elif (_sw, _sh) not in _standard:
-                        self._log(
-                            f"  NOTE: Display resolution {_sw}x{_sh} is close to "
-                            f"16:9 but not a standard resolution. If the bot has "
-                            f"trouble detecting menus, try 1920x1080 in Fullscreen "
-                            f"or Borderless Fullscreen mode.")
+                    self._log(
+                        f"  Pre-launch fallback display: {_sw}x{_sh} "
+                        f"(game monitor will be detected after launch)")
                 except Exception:
                     pass
                 # ── Diagnostic logger ─────────────────────────────────────
@@ -7607,6 +7628,34 @@ class RelicBotApp(tk.Tk):
 
             # Game window confirmed — begin adaptive load wait (Phase -0.5).
             self._log("Game window focused — starting adaptive load wait…")
+            try:
+                _capture_info = screen_capture.get_capture_monitor_info(exe_name)
+                _capture_device = _capture_info.get("device", "unknown display")
+                _capture_source = _capture_info.get("source", "unknown")
+                self._log(
+                    f"  [Capture] Nightreign monitor: {_capture_device} | "
+                    f"{_capture_info['width']}x{_capture_info['height']} | "
+                    f"left={_capture_info['left']} top={_capture_info['top']} | "
+                    f"{_capture_source}")
+                _sw = _capture_info["width"]
+                _sh = _capture_info["height"]
+                _is_16_9 = abs(_sw / _sh - 16 / 9) < 0.02
+                _standard = {
+                    (1280, 720), (1366, 768), (1600, 900),
+                    (1920, 1080), (2560, 1440), (3840, 2160),
+                }
+                if not _is_16_9:
+                    self._log(
+                        f"  NOTE: Game display aspect ratio ({_sw}:{_sh}) is not "
+                        f"16:9. Screen detection is calibrated for 16:9 displays.")
+                elif (_sw, _sh) not in _standard:
+                    self._log(
+                        f"  NOTE: Game display resolution {_sw}x{_sh} is not a "
+                        f"standard supported resolution.")
+            except Exception as _capture_error:
+                self._log(
+                    f"  [Capture] Monitor detection unavailable "
+                    f"({_capture_error}); using legacy fallback.")
             if self._diag:
                 try:
                     self._diag.phase_start("Phase -0.5 (game load)")
@@ -14154,6 +14203,15 @@ class RelicBotApp(tk.Tk):
             return False, str(e)
 
     @staticmethod
+    def _check_directml_available() -> tuple[bool, str]:
+        """Return whether the experimental DirectML OCR adapter is ready."""
+        try:
+            from bot.directml_easyocr import directml_status
+            return directml_status(require_models=True)
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
     def _cuda_torch_installed() -> bool:
         """
         Return True if CUDA torch files appear to be installed next to the EXE.
@@ -14710,18 +14768,26 @@ class RelicBotApp(tk.Tk):
         lines.append("")
 
         # ── Hardware / CUDA ───────────────────────────────────────────── #
-        lines.append("=== Hardware & CUDA ===")
+        lines.append("=== Hardware & GPU OCR ===")
         lines.append(f"GPU name:              {self._hw_gpu_name or 'unknown'}")
         lines.append(f"RAM:                   {self._hw_ram_gb or 'unknown'} GB")
         lines.append(f"CPU cores:             {self._hw_cpu_cores or 'unknown'}")
-        lines.append(f"CUDA available:        {self._hw_cuda_available}")
-        lines.append(f"CUDA error:            {self._hw_cuda_error or 'none'}")
-        lines.append(f"CUDA torch installed:  {self._hw_cuda_torch_installed}")
-        lines.append(f"GPU eligible to install: {self._gpu_eligible}")
-        if self._gpu_eligible_name:
-            lines.append(f"GPU eligible name:     {self._gpu_eligible_name}")
-        if self._gpu_eligible_reason:
-            lines.append(f"GPU eligible reason:   {self._gpu_eligible_reason}")
+        lines.append(f"GPU OCR backend:       {self._hw_gpu_backend or 'none'}")
+        if self._hw_gpu_backend == "DirectML":
+            lines.append(f"DirectML available:    {self._hw_directml_available}")
+            lines.append(
+                "OCR routing:           controls/navigation = CPU EasyOCR; "
+                "relic analysis = DirectML")
+        else:
+            lines.append(f"CUDA available:        {self._hw_cuda_available}")
+            lines.append(f"DirectML available:    {self._hw_directml_available}")
+            lines.append(f"CUDA error:            {self._hw_cuda_error or 'none'}")
+            lines.append(f"CUDA torch installed:  {self._hw_cuda_torch_installed}")
+            lines.append(f"GPU eligible to install: {self._gpu_eligible}")
+            if self._gpu_eligible_name:
+                lines.append(f"GPU eligible name:     {self._gpu_eligible_name}")
+            if self._gpu_eligible_reason:
+                lines.append(f"GPU eligible reason:   {self._gpu_eligible_reason}")
         lines.append("")
 
         # ── Key file presence ─────────────────────────────────────────── #
@@ -15553,7 +15619,7 @@ class RelicBotApp(tk.Tk):
         """
         ram      = self._hw_ram_gb
         cpus     = self._hw_cpu_cores
-        has_cuda = getattr(self, "_hw_cuda_available", False)
+        has_cuda = getattr(self, "_hw_gpu_accel_available", False)
 
         _unknown = ("?", "hardware not detected")
         if not ram or not cpus:
@@ -15566,13 +15632,14 @@ class RelicBotApp(tk.Tk):
 
         # ── GPU Acceleration ──────────────────────────────────────────── #
         if has_cuda:
-            gpu = ("ON", f"CUDA detected — {self._hw_gpu_name}")
+            gpu = ("ON", f"{self._hw_gpu_backend} detected — {self._hw_gpu_name}")
         elif getattr(self, "_gpu_eligible", False):
             gpu = ("Install", f"compatible GPU found — use Install button ({self._gpu_eligible_name})")
         elif getattr(self, "_gpu_eligible_name", ""):
             gpu = ("OFF", self._gpu_eligible_reason or "see GPU status above")
         else:
-            gpu = ("OFF", "no compatible NVIDIA GPU detected")
+            _dml_reason = getattr(self, "_hw_directml_error", "")
+            gpu = ("OFF", _dml_reason or "no supported GPU OCR runtime detected")
 
         # ── Hybrid GPU+CPU ────────────────────────────────────────────── #
         if has_cuda and cpus >= 4:
@@ -15720,7 +15787,7 @@ class RelicBotApp(tk.Tk):
         # whose parent is off — no special-casing needed here.
 
         # GPU settings first (other settings depend on GPU state)
-        gpu_on = recs["gpu"][0] == "ON" and self._hw_cuda_available
+        gpu_on = recs["gpu"][0] == "ON" and self._hw_gpu_accel_available
         self._gpu_accel_var.set(gpu_on)
         self._hybrid_var.set(gpu_on and recs["hybrid"][0] == "ON")
         self._gpu_always_analyze_var.set(gpu_on and recs["gpu_aa"][0] == "ON")
